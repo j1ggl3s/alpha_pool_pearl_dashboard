@@ -18,7 +18,7 @@ HISTORY_FILE_NAME = "persistent_miner.log"
 
 # Optional: Add your public wallet address to track your personal unpaid balances & history
 # Leave as None or "" to hide the wallet statistics card completely.
-WALLET_ADDRESS = "prl1pxnyumpgjwf32ks5hhpp6pzr77742xcjpdmuqelgeyut697udqr6q29sgqy"
+WALLET_ADDRESS = ""
 
 # 🔌 ELECTRICITY COST & BILLING CONFIGURATIONS
 USE_TIME_OF_USE = True         # Set to True to calculate multi-tier dynamic rates; False for a single Flat rate
@@ -152,8 +152,8 @@ except Exception:
 # API Tracking Cache
 last_api_fetch_time = None
 cached_wtm_data = None
-cached_btc_usd = 65000.0  
-cached_historical_btc = {"1d": 65000.0, "3d": 65000.0, "7d": 65000.0} 
+cached_btc_usd = None  
+cached_historical_btc = {"1d": None, "3d": None, "7d": None} 
 cached_pool_data = None
 cached_wallet_data = None
 
@@ -228,7 +228,7 @@ start_time = None
 total_shares = 0
 total_errors = 0
 hashrates = []
-current_difficulty = "65536"
+current_difficulty = "[FETCHING...]"
 last_attempts = 0
 last_hits = 0
 last_tmac = 0.0
@@ -444,10 +444,14 @@ try:
                         coin_btc_7d = float(api_data.get('exchange_rate7', 0.0))
                     except (ValueError, TypeError): pass
                     
-                    coin_price_usd = coin_btc_value * btc_price_usd
-                    coin_usd_24h = coin_btc_24h * btc_price_24h
-                    coin_usd_3d = coin_btc_3d * btc_price_3d
-                    coin_usd_7d = coin_btc_7d * btc_price_7d
+                    if btc_price_usd is not None:
+                        coin_price_usd = coin_btc_value * btc_price_usd
+                    if btc_price_24h is not None:
+                        coin_usd_24h = coin_btc_24h * btc_price_24h
+                    if btc_price_3d is not None:
+                        coin_usd_3d = coin_btc_3d * btc_price_3d
+                    if btc_price_7d is not None:
+                        coin_usd_7d = coin_btc_7d * btc_price_7d
                     
                     try:
                         wtm_daily_revenue_usd = float(api_data.get('revenue', '$0.00').replace('$', '').strip())
@@ -483,7 +487,7 @@ try:
                     except Exception: pass
 
                 # Dynamic Profit Matrix Configurations
-                if usd_per_th_day > 0:
+                if usd_per_th_day > 0 and btc_price_usd is not None:
                     rev_day = avg_pool_equiv * usd_per_th_day
                     rev_hour, rev_week, rev_month = rev_day / 24.0, rev_day * 7.0, rev_day * 30.416
                 else:
@@ -499,7 +503,7 @@ try:
                 def get_historical_metrics(lookback_hours):
                     cutoff = (current_time - timedelta(hours=lookback_hours)).timestamp()
                     valid_entries = [e for e in dashboard_history if e[0] >= cutoff]
-                    if not valid_entries or usd_per_th_day == 0: return 0.0, 0.0, 0.0
+                    if not valid_entries or usd_per_th_day == 0 or btc_price_usd is None: return 0.0, 0.0, 0.0
                     
                     active_mining_hours = min(float(lookback_hours), elapsed_mins / 60.0)
                     hist_avg_hr = sum(e[3] for e in valid_entries) / len(valid_entries)
@@ -550,30 +554,52 @@ try:
                 if WALLET_ADDRESS and wallet_data:
                     print("\n" + "═" * 85, flush=True)
                     print(f" 💼 [MY PERSONAL WALLET STATISTICS] ", flush=True)
-                    print(f"  • Pending Balance     : {balance_prl:.8f} {coin_tag} (${balance_usd:.2f} USD)", flush=True)
-                    print(f"  • Total Accum. Paid   : {total_paid_prl:.8f} {coin_tag} (${total_paid_usd:.2f} USD)", flush=True)
+                    if btc_price_usd is not None:
+                        print(f"  • Pending Balance     : {balance_prl:.8f} {coin_tag} (${balance_usd:.2f} USD)", flush=True)
+                        print(f"  • Total Accum. Paid   : {total_paid_prl:.8f} {coin_tag} (${total_paid_usd:.2f} USD)", flush=True)
+                    else:
+                        print(f"  • Pending Balance     : {balance_prl:.8f} {coin_tag} ([API OFFLINE])", flush=True)
+                        print(f"  • Total Accum. Paid   : {total_paid_prl:.8f} {coin_tag} ([API OFFLINE])", flush=True)
                     if payments_by_day:
                         print(f"  • Payouts History (By Date):", flush=True)
                         for item in payments_by_day[:4]:
                             amt_prl = float(item.get('amount_prl', 0.0))
-                            amt_usd = amt_prl * coin_price_usd
-                            print(f"    - {item.get('day', 'Unknown')} : {amt_prl:.4f} {coin_tag} (${amt_usd:.2f} USD)", flush=True)
+                            if btc_price_usd is not None:
+                                amt_usd = amt_prl * coin_price_usd
+                                print(f"    - {item.get('day', 'Unknown')} : {amt_prl:.4f} {coin_tag} (${amt_usd:.2f} USD)", flush=True)
+                            else:
+                                print(f"    - {item.get('day', 'Unknown')} : {amt_prl:.4f} {coin_tag} ([API OFFLINE])", flush=True)
                 print("═" * 85, flush=True)
                 
                 print(f"\n📈 [MARKET TICKER & WHATTO MINE HISTORICAL AVERAGES]", flush=True)
-                print(f"  • Spot Live     :  ₿ BTC: ${btc_price_usd:,.2f}  |  🦪 {coin_tag} Value: {coin_btc_value:.8f} BTC (${coin_price_usd:.4f} USD)", flush=True)
-                print(f"  • 24hr Average  :  ₿ BTC: ${btc_price_24h:,.2f}  |  🦪 {coin_tag} Value: {coin_btc_24h:.8f} BTC (${coin_usd_24h:.4f} USD)", flush=True)
-                print(f"  • 3-Day Average :  ₿ BTC: ${btc_price_3d:,.2f}  |  🦪 {coin_tag} Value: {coin_btc_3d:.8f} BTC (${coin_usd_3d:.4f} USD)", flush=True)
-                print(f"  • 7-Day Average :  ₿ BTC: ${btc_price_7d:,.2f}  |  🦪 {coin_tag} Value: {coin_btc_7d:.8f} BTC (${coin_usd_7d:.4f} USD)", flush=True)
+                if btc_price_usd is not None:
+                    print(f"  • Spot Live     :  ₿ BTC: ${btc_price_usd:,.2f}  |  🦪 {coin_tag} Value: {coin_btc_value:.8f} BTC (${coin_price_usd:.4f} USD)", flush=True)
+                    print(f"  • 24hr Average  :  ₿ BTC: ${btc_price_24h:,.2f}  |  🦪 {coin_tag} Value: {coin_btc_24h:.8f} BTC (${coin_usd_24h:.4f} USD)", flush=True)
+                    print(f"  • 3-Day Average :  ₿ BTC: ${btc_price_3d:,.2f}  |  🦪 {coin_tag} Value: {coin_btc_3d:.8f} BTC (${coin_usd_3d:.4f} USD)", flush=True)
+                    print(f"  • 7-Day Average :  ₿ BTC: ${btc_price_7d:,.2f}  |  🦪 {coin_tag} Value: {coin_btc_7d:.8f} BTC (${coin_usd_7d:.4f} USD)", flush=True)
+                else:
+                    print(f"  • Spot Live     :  ₿ BTC: [API OFFLINE]  |  🦪 {coin_tag} Value: [API OFFLINE]", flush=True)
+                    print(f"  • 24hr Average  :  ₿ BTC: [API OFFLINE]  |  🦪 {coin_tag} Value: [API OFFLINE]", flush=True)
+                    print(f"  • 3-Day Average :  ₿ BTC: [API OFFLINE]  |  🦪 {coin_tag} Value: [API OFFLINE]", flush=True)
+                    print(f"  • 7-Day Average :  ₿ BTC: [API OFFLINE]  |  🦪 {coin_tag} Value: [API OFFLINE]", flush=True)
                 
                 print(f"\n💰 [REAL-TIME PROFIT FORECAST] (Elec Billing: {'Time-of-Use' if USE_TIME_OF_USE else 'Static'} | Rate: ${current_rate:.3f}/kWh)", flush=True)
-                print(f"  • Hourly : Gross: ${rev_hour:.2f}  | Elec: ${cost_hour:.2f}  | Net: {'+' if (rev_hour-cost_hour)>=0 else ''}${rev_hour - cost_hour:.2f}", flush=True)
-                print(f"  • Daily  : Gross: ${rev_day:.2f}  | Elec: ${cost_day:.2f}  | Net: {'+' if (rev_day-cost_day)>=0 else ''}${rev_day - cost_day:.2f}", flush=True)
-                print(f"  • Monthly: Gross: ${rev_month:.2f}| Elec: ${cost_month:.2f} | Net: {'+' if (rev_month-cost_month)>=0 else ''}${rev_month - cost_month:.2f}", flush=True)
+                if btc_price_usd is not None and usd_per_th_day > 0:
+                    print(f"  • Hourly : Gross: ${rev_hour:.2f}  | Elec: ${cost_hour:.2f}  | Net: {'+' if (rev_hour-cost_hour)>=0 else ''}${rev_hour - cost_hour:.2f}", flush=True)
+                    print(f"  • Daily  : Gross: ${rev_day:.2f}  | Elec: ${cost_day:.2f}  | Net: {'+' if (rev_day-cost_day)>=0 else ''}${rev_day - cost_day:.2f}", flush=True)
+                    print(f"  • Monthly: Gross: ${rev_month:.2f}| Elec: ${cost_month:.2f} | Net: {'+' if (rev_month-cost_month)>=0 else ''}${rev_month - cost_month:.2f}", flush=True)
+                else:
+                    print(f"  • Hourly : Gross: [API OFFLINE]  | Elec: ${cost_hour:.2f}  | Net: [API OFFLINE]", flush=True)
+                    print(f"  • Daily  : Gross: [API OFFLINE]  | Elec: ${cost_day:.2f}  | Net: [API OFFLINE]", flush=True)
+                    print(f"  • Monthly: Gross: [API OFFLINE]  | Elec: ${cost_month:.2f} | Net: [API OFFLINE]", flush=True)
                 
                 print(f"\n📈 [HISTORICAL PERFORMANCE LOGS] (Based on true runtime metrics)", flush=True)
-                print(f"  • Past 1 Hour  : Gross: ${rev_1h:.2f}  | Elec Cost: ${cost_1h:.2f}  | Net: {'+' if prof_1h>=0 else ''}${prof_1h:.2f}", flush=True)
-                print(f"  • Past 24 Hours: Gross: ${rev_24h:.2f} | Elec Cost: ${cost_24h:.2f} | Net: {'+' if prof_24h>=0 else ''}${prof_24h:.2f}", flush=True)
+                if btc_price_usd is not None and usd_per_th_day > 0:
+                    print(f"  • Past 1 Hour  : Gross: ${rev_1h:.2f}  | Elec Cost: ${cost_1h:.2f}  | Net: {'+' if prof_1h>=0 else ''}${prof_1h:.2f}", flush=True)
+                    print(f"  • Past 24 Hours: Gross: ${rev_24h:.2f} | Elec Cost: ${cost_24h:.2f} | Net: {'+' if prof_24h>=0 else ''}${prof_24h:.2f}", flush=True)
+                else:
+                    print(f"  • Past 1 Hour  : Gross: [API OFFLINE]  | Elec Cost: ${cost_1h:.2f}  | Net: [API OFFLINE]", flush=True)
+                    print(f"  • Past 24 Hours: Gross: [API OFFLINE]  | Elec Cost: ${cost_24h:.2f} | Net: [API OFFLINE]", flush=True)
                 print("═" * 85 + "\n", flush=True)
 
             elif "level=ERROR" in clean_line or "level=WARN" in clean_line or "failed" in clean_line.lower():
