@@ -72,7 +72,7 @@ If your Power or Temperature reads zero, this means you are either running an AM
 
 ## Key Notes
 
-I added this to my stop_mining.bat file to keep the logs after docker stop.  It's not really tested yet but I've integrated the code to pull that file in if it's there.
+I added this to my stop_mining.bat file to keep the logs before docker down.  It's not really tested yet but I've integrated the code to pull that file in if it's there.
 
 `echo Saving the existing terminal logs out to a temp file before deleting the container`
 
