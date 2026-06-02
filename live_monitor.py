@@ -1,3 +1,11 @@
+# ===========================================================================
+# 📊 DOCKER MINER LIVE DASHBOARD MONITOR
+# 🛠️ A real-time performance, hardware telemetry, and profit tracker for PRL.
+# 🧑‍💻 Created by: j1ggl3s
+# ☕ Donations (PRL): prl1p9lx4vm9zkus5vz3gace0qdf9mrz3w6nvl30chfcsmm6ekyaqlp5slp9shw
+# ===========================================================================
+
+
 #pip install nvidia-ml-py
 
 import subprocess
