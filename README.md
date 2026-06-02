@@ -1,8 +1,10 @@
-Docker Miner Live Dashboard Monitor
+## I had AI write this for me, forgive any mistakes
+
+# Docker Miner Live Dashboard Monitor
 
 This is a dynamic, real-time command line dashboard and performance tracker for mining Pearl inside Docker containers. This Python script automatically aggregates information from your active container logs, localized historic files, your graphics card telemetry, online market pricing index APIs, and pool data to build a consolidated performance monitor.
 
-Core Features
+## Core Features
 
 Log Ingestion Pipeline: Automatically scans historical Docker logs on startup, filters past submissions, and maps continuous metrics without slowing down your computer memory.
 
@@ -18,27 +20,33 @@ Live Profit Matrix Forecasting: Automatically fetches spot pricing and historica
 
 Advanced Time of Use Billing Engine: Supports multi tier chronological electricity cost calculations such as Summer Peak versus Off Peak versus Winter Baseline configurations.
 
-Prerequisites and Setup
+## Prerequisites and Setup
 
 This script works on Windows, Linux, or macOS where your mining container is running. Follow these simple steps to set it up.
 
-Step One: Install Python
+### Step One: Install Python
 
-Ensure Python version 3.8 or newer is installed on your computer. If you are on Windows, download it from python.org and make sure you check the box that says Add Python to PATH during the installation process. If you are on Linux, run the command sudo apt update followed by sudo apt install python3 python3-pip in your terminal.
+Ensure Python version 3.8 or newer is installed on your computer. 
+If you are on Windows, download it from python.org and make sure you check the box that says Add Python to PATH during the installation process. 
+If you are on Linux, run the command `sudo apt update` followed by `sudo apt install python3 python3-pip` in your terminal.
 
-Step Two: Install Hardware Tracking Dependencies
+### Step Two: Install Hardware Tracking Dependencies
 
 Open your Command Prompt or Terminal and run the following command to allow Python to communicate with Nvidia hardware:
 
 `pip install nvidia-ml-py`
 
-Step Three: Configure Your Settings
+### Step Three: Download File & Configure Your Settings
+
+I would suggest just downloading the live_monitor.py file or do a copy paste of the code into notepad and rename it.  Save it to your AlphaMiner directory.
+
+<img width="400" height="400" alt="image" src="https://github.com/user-attachments/assets/b3fdf3f5-d195-40f7-9991-77c37f361669" />
 
 Open live_monitor.py in any plain text editor like Notepad. Locate the USER CONFIGURATIONS block at the top and customize your settings. You can change the container name to match your active Docker setup, paste your wallet address, or adjust your electricity cost settings.
 
 <img width="550" height="250" alt="image" src="https://github.com/user-attachments/assets/6f1dc99d-cfac-4369-abf8-74f2b78f4edc" />
 
-How to Run It
+## How to Run It
 
 First, ensure your mining Docker container is currently up and running.
 
@@ -52,7 +60,7 @@ During Phase One, the script will digest historical records to calibrate your av
 
 To stop the script at any time, press the CTRL and C keys on your keyboard together to exit safely.
 
-Troubleshooting Common Issues
+## Troubleshooting Common Issues
 
 If you see a Docker Error message, your container named in the script configuration is either spelled wrong or the Docker Desktop application is not running.
 
