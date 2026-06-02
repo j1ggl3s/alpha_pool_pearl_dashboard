@@ -61,6 +61,8 @@ WTM_PROFIT_OFFSET_PCT = 15.0
 # ═══════════════════════════════════════════════════════════════════════════
 
 
+
+
 # Define global history tracker up front
 dashboard_history = []
 
@@ -230,7 +232,7 @@ def fetch_market_data():
         try:
             req3 = urllib.request.Request("https://blockchain.info/ticker", headers={'User-Agent': 'Mozilla/5.0'})
             with urllib.request.urlopen(req3, timeout=4) as resp3:
-                backup_json = json.loads(resp3.read().decode())
+                backup_json = json.loads(backup_json := resp3.read().decode())
                 cached_btc_usd = float(backup_json['USD']['last'])
             btc_ok = True
             print("   • Blockchain.info (BTC Backup) : 🟢 OK", flush=True)
@@ -282,7 +284,9 @@ def fetch_market_data():
 # Core Pipeline Metrics & State Scoping
 seen_lines = []
 start_time = None
+monitor_script_start_time = datetime.now()  # Track session duration for this specific script run
 total_shares = 0
+session_shares = 0
 total_errors = 0
 recent_errors_log = []  
 hashrates = []
@@ -466,10 +470,15 @@ try:
 
                 if "component=share submitted" in clean_line:
                     total_shares += 1
+                    session_shares += 1
                     share_timestamps.append(line_ts)
                     now_track = datetime.now()
                     elapsed_mins = (now_track - start_time).total_seconds() / 60.0
                     overall_shares_per_min = total_shares / elapsed_mins if elapsed_mins > 0 else 0.0
+                    
+                    # Calculate session duration specifically for this running console interface
+                    session_elapsed_mins = (now_track - monitor_script_start_time).total_seconds() / 60.0
+                    session_shares_per_min = session_shares / max(1 / 60, session_elapsed_mins) if session_elapsed_mins > 0 else 0.0
                     
                     share_timestamps = [ts for ts in share_timestamps if (now_track - ts).total_seconds() <= 60]
                     if len(share_timestamps) > 1:
@@ -479,7 +488,7 @@ try:
                         last_min_shares_per_min = float(len(share_timestamps))
                     
                     if current_view == "DASHBOARD":
-                        print(f"⏱️ [{line_ts.strftime('%H:%M:%S')}] 🟢 SHARE ACCEPTED! Total: {total_shares} | Last 1m Pace: {last_min_shares_per_min:.2f} shares/min | Overall Pace: {overall_shares_per_min:.2f} shares/min", flush=True)
+                        print(f"⏱️ [{line_ts.strftime('%H:%M:%S')}] 🟢 SHARE ACCEPTED! Total: {total_shares} | Last 1m Pace: {last_min_shares_per_min:.2f} shares/min | Session Pace: {session_shares_per_min:.2f} shares/min | Overall Pace: {overall_shares_per_min:.2f} shares/min", flush=True)
 
                 elif "component=miner status" in clean_line:
                     attempts_match = re.search(r"attempts=(\d+)", clean_line)
