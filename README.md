@@ -68,5 +68,23 @@ If your Hardware Speed or Pool Stats show FETCHING, the script simply requires a
 
 If your Power or Temperature reads zero, this means you are either running an AMD graphics card or your Nvidia drivers are currently inaccessible. The program will skip hardware telemetry gracefully and continue tracking everything else.
 
+## Key Notes
+
+I added this to my stop_mining.bat file to keep the logs after docker stop.  It's not really tested yet but I've integrated the code to pull that file in if it's there.
+
+`echo Saving the existing terminal logs out to a temp file before deleting the container`
+
+`docker compose logs alphaminer --no-log-prefix >> persistent_miner.log`
+
+<img width="450" height="200" alt="image" src="https://github.com/user-attachments/assets/6f51dc4f-d7ee-4b62-89d3-d823e5a5a8b4" />
+
+I added this to the docker-compose.yml file.  I don't think it's required but if your logs are looking right then you might need it.
+
+`tty: true`
+
+`command: ["--status-interval", "30", "--debug-logs"]`
+
+<img width="500" height="100" alt="image" src="https://github.com/user-attachments/assets/2ec6fc1d-4055-46ad-bd12-f03a17269e16" />
+
 
 
