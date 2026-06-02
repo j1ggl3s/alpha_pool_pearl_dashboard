@@ -36,6 +36,8 @@ Step Three: Configure Your Settings
 
 Open live_monitor.py in any plain text editor like Notepad. Locate the USER CONFIGURATIONS block at the top and customize your settings. You can change the container name to match your active Docker setup, paste your wallet address, or adjust your electricity cost settings.
 
+<img width="550" height="250" alt="image" src="https://github.com/user-attachments/assets/6f1dc99d-cfac-4369-abf8-74f2b78f4edc" />
+
 How to Run It
 
 First, ensure your mining Docker container is currently up and running.
@@ -57,3 +59,6 @@ If you see a Docker Error message, your container named in the script configurat
 If your Hardware Speed or Pool Stats show FETCHING, the script simply requires a few moments to wait for the miner inside your container to print out its first operational status report lines.
 
 If your Power or Temperature reads zero, this means you are either running an AMD graphics card or your Nvidia drivers are currently inaccessible. The program will skip hardware telemetry gracefully and continue tracking everything else.
+
+
+
