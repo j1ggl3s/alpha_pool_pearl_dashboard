@@ -34,7 +34,7 @@ container_name = "alpha-miner"
 HISTORY_FILE_NAME = "persistent_miner.log"
 
 # Public key address used to pull pool-side worker shares, balances, and payment metrics.
-WALLET_ADDRESS = "prl1pxnyumpgjwf32ks5hhpp6pzr77742xcjpdmuqelgeyut697udqr6q29sgqy"
+WALLET_ADDRESS = ""
 
 # POWER EXPENSE ENGINE SWITCH:
 # Set to True to use dynamic, tier-based power tracking using seasonal/hourly schedules.
