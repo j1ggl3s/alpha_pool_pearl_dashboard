@@ -37,6 +37,7 @@ Open your Command Prompt or Terminal and run the following command to allow Pyth
 TIP:  If you hold shift then right-click in an empty space in the directory, without a file selected, you will get extra commands.  Choose Open PowerShell Window here.
 
 `pip install nvidia-ml-py`
+`pip install textual pynvml psutil`
 
 ### Step Three: Download File & Configure Your Settings
 
