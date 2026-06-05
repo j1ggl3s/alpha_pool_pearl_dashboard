@@ -5,7 +5,7 @@
 # ☕ Donations (PRL): prl1p9lx4vm9zkus5vz3gace0qdf9mrz3w6nvl30chfcsmm6ekyaqlp5slp9shw
 # ===========================================================================
 
-#pip install textual pynvml
+#pip install textual pynvml psutil
 
 import subprocess
 import urllib.request
@@ -19,7 +19,7 @@ import pynvml
 
 from textual.app import App, ComposeResult
 from textual.widgets import Header, Footer, Static, RichLog
-from textual.containers import Container, Vertical, ScrollableContainer
+from textual.containers import Container, Vertical, ScrollableContainer, Horizontal
 from textual import work
 from textual.binding import Binding
 
@@ -61,7 +61,7 @@ session_shares = 0
 total_errors = 0
 recent_errors_log = []  
 hashrates = []
-current_difficulty = "\\[FETCHING...\\]"
+current_difficulty = "[red]\\[FETCHING...\\][/red]"
 last_attempts = 0
 last_hits = 0
 last_tmac = 0.0
@@ -69,14 +69,10 @@ last_share_equiv_th = 0.0
 share_timestamps = []
 last_stream_refresh_time = "Pending initial status..."  # Tracks true telemetry events only
 
-# Log-filtering pipelines
-raw_log_history = []     # Keeps a rolling memory cache of all captured log tuples
-hide_shares_flag = False  # View toggle state: True mutes share logs, False shows everything
+# Log-filtering pipeline
+raw_log_history = []     # Rolling memory cache of all generated log tuples: (category, text)
 
 # Volatile hardware telemetry slots
-current_hr = 0.0
-avg_hr = 0.0
-avg_pool_equiv = 0.0
 current_w = 0.0
 temp_c = 0.0
 
@@ -137,49 +133,71 @@ def project_future_cost(start_dt, wattage, total_hours):
         total_cost += kw * get_kwh_rate(temp_dt) * fraction
     return total_cost
 
-def load_history_from_local_file():
-    """Scrapes up to 10,000 historic entries from local log to build moving averages at boot."""
+def load_history_from_local_file(app=None):
     global dashboard_history
-    if not os.path.exists(HISTORY_FILE_NAME):
+    
+    # 📢 Helper to log to the UI safely based on whether we are in a background worker or main thread
+    def ui_log(msg, channel="app"):
+        if app:
+            try:
+                # If we are in a background worker, use call_from_thread
+                import threading
+                if app._thread_id != threading.get_ident():
+                    app.call_from_thread(app.log_msg, msg, channel)
+                else:
+                    # If we are running directly on the main thread, call it natively
+                    app.log_msg(msg, channel)
+            except Exception:
+                pass
+
+    #ui_log("⚙️ [Phase 1] Processing historical log file records...")
+    
+    target_file = "persistent_miner.log"
+    
+    if not os.path.exists(target_file):
+        ui_log(f"❌ [Phase 1] Critical error: File '{target_file}' not found!")
         return
-    hr_regex = re.compile(r"Hardware Speed\s*:\s*([\d.]+)\s*TH/s")
-    pool_regex = re.compile(r"Pool Efficiency:\s*([\d.]+)\s*TH/s")
-    pwr_regex = re.compile(r"Power & Thermal:\s*([\d.]+)W\s*@\s*([\d.]+)°C")
+        
+    ansi_cleaner_regex = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])|\[\d+(?:\;\d+)?m")
+    
+    # 🎯 Match exact status pattern groups directly from the continuous line stream
+    status_block_regex = re.compile(
+        r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z).*?component=miner status attempts=(\d+) hits=(\d+)\s+hashrate_th_s=([\d.]+).*?share_equiv_th_s=([\d.]+)"
+    )
+
     try:
-        with open(HISTORY_FILE_NAME, "r", errors="ignore") as f:
-            lines = f.readlines()
-    except Exception:
+        with open(target_file, "r", errors="ignore") as f:
+            raw_content = f.read()
+        #ui_log(f"大 [Phase 1] Log file found. Loaded {len(raw_content):,} characters.")
+    except Exception as e:
+        ui_log(f"❌ [Phase 1] Failed reading log file: {e}")
         return
-    recovered_entries = []
-    fake_timestamp = datetime.now()
-    c_hr = 0.0
-    l_pool = 0.0
-    c_w = 0.0
-    t_c = 0.0
-    for line in reversed(lines[:10000]):
-        pwr_match = pwr_regex.search(line)
-        pool_match = pool_regex.search(line)
-        hr_match = hr_regex.search(line)
-        if pwr_match:
-            c_w = float(pwr_match.group(1))
-            t_c = float(pwr_match.group(2))
-        if pool_match:
-            l_pool = float(pool_match.group(1))
-        if hr_match:
-            c_hr = float(hr_match.group(1))
-            if c_hr > 0 and l_pool > 0:
-                fake_timestamp -= timedelta(seconds=30) 
-                if datetime.now() - fake_timestamp > timedelta(hours=24):
-                    break
-                recovered_entries.append([
-                    fake_timestamp.timestamp(), 
-                    l_pool, 
-                    c_w, 
-                    c_hr, 
-                    t_c
-                ])
-                c_hr = l_pool = c_w = t_c = 0.0
-    dashboard_history.extend(list(reversed(recovered_entries)))
+
+    # Scrub out color ANSI markers ("?" boxes)
+    cleaned_content = ansi_cleaner_regex.sub("", raw_content)
+    cleaned_content = cleaned_content.replace("[entrypoint] ", "")
+
+    match_count = 0
+    temp_history_stack = []
+
+    for match in status_block_regex.finditer(cleaned_content):
+        raw_ts = match.group(1)
+        last_hr = float(match.group(4))
+        last_se = float(match.group(5))
+        
+        c_w = 103.2  
+        t_c = 53.0
+        
+        try:
+            from datetime import datetime
+            dt_parsed = datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
+            temp_history_stack.append([dt_parsed.timestamp(), last_se, c_w, last_hr, t_c])
+            match_count += 1
+        except Exception:
+            pass
+
+    dashboard_history = temp_history_stack[-10000:]
+    #ui_log(f"🎉 [Phase 1] Done! Parsed & added {match_count:,} historical frames to memory.")
 
 def fetch_market_data(app=None):
     """Queries external public ledger and currency exchange endpoints with a 5-minute cache protection."""
@@ -189,16 +207,16 @@ def fetch_market_data(app=None):
         return cached_wtm_data, cached_btc_usd, cached_historical_btc, cached_pool_data, cached_wallet_data
     
     if app:
-        app.call_from_thread(app.query_one("#log_feed").write, "🌐 Querying dynamic financial indicators from APIs...")
+        app.call_from_thread(app.log_msg, f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 🌐 Querying dynamic financial indicators from APIs...", "app")
 
     # 1. WhatToMine Market Parsing
     try:
         req1 = urllib.request.Request("https://whattomine.com/coins/469.json", headers={'User-Agent': 'Mozilla/5.0'})
         with urllib.request.urlopen(req1, timeout=4) as resp1:
             cached_wtm_data = json.loads(resp1.read().decode())
-        if app: app.call_from_thread(app.query_one("#log_feed").write, "   • WhatToMine (Rewards Matrix)  : 🟢 OK")
+        if app: app.call_from_thread(app.log_msg, "   • WhatToMine (Rewards Matrix)  : 🟢 OK", "app")
     except Exception:
-        if app: app.call_from_thread(app.query_one("#log_feed").write, "   • WhatToMine (Rewards Matrix)  : ❌ FAIL")
+        if app: app.call_from_thread(app.log_msg, "   • WhatToMine (Rewards Matrix)  : ❌ FAIL", "app")
         
     # 2. Bitcoin Price Spot Tracker
     try:
@@ -206,16 +224,16 @@ def fetch_market_data(app=None):
         with urllib.request.urlopen(req2, timeout=4) as resp2:
             btc_json = json.loads(resp2.read().decode())
             cached_btc_usd = float(btc_json['bpi']['USD']['rate_float'])
-        if app: app.call_from_thread(app.query_one("#log_feed").write, "   • Blockchain.info (BTC Tracker): 🟢 OK")
+        if app: app.call_from_thread(app.log_msg, "   • Blockchain.info (BTC Tracker): 🟢 OK", "app")
     except Exception:
         try:
             req3 = urllib.request.Request("https://blockchain.info/ticker", headers={'User-Agent': 'Mozilla/5.0'})
             with urllib.request.urlopen(req3, timeout=4) as resp3:
                 backup_json = json.loads(resp3.read().decode())
                 cached_btc_usd = float(backup_json['USD']['last'])
-            if app: app.call_from_thread(app.query_one("#log_feed").write, "   • Blockchain.info (BTC Backup) : 🟢 OK")
+            if app: app.call_from_thread(app.log_msg, "   • Blockchain.info (BTC Backup) : 🟢 OK", "app")
         except Exception:
-            if app: app.call_from_thread(app.query_one("#log_feed").write, "   • Blockchain.info (BTC Feed)   : ❌ FAIL")
+            if app: app.call_from_thread(app.log_msg, "   • Blockchain.info (BTC Feed)   : ❌ FAIL", "app")
 
     # 3. CoinGecko Moving Average Benchmarks
     try:
@@ -227,21 +245,21 @@ def fetch_market_data(app=None):
                 cached_historical_btc["1d"] = float(prices[-2][1])
                 cached_historical_btc["3d"] = float(prices[-4][1])
                 cached_historical_btc["7d"] = float(prices[0][1])
-        if app: app.call_from_thread(app.query_one("#log_feed").write, "   • CoinGecko (Historical BTC)   : 🟢 OK")
+        if app: app.call_from_thread(app.log_msg, "   • CoinGecko (Historical BTC)   : 🟢 OK", "app")
     except Exception:
         cached_historical_btc["1d"] = cached_btc_usd
         cached_historical_btc["3d"] = cached_btc_usd
         cached_historical_btc["7d"] = cached_btc_usd
-        if app: app.call_from_thread(app.query_one("#log_feed").write, "   • CoinGecko (Historical BTC)   : ❌ FAIL (Using Spot Backup)")
+        if app: app.call_from_thread(app.log_msg, "   • CoinGecko (Historical BTC)   : ❌ FAIL (Using Spot Backup)", "app")
 
     # 4. AlphaPool Hashrate Aggregations
     try:
         req5 = urllib.request.Request("https://pearl.alphapool.tech/api/stats", headers={'User-Agent': 'Mozilla/5.0'})
         with urllib.request.urlopen(req5, timeout=4) as resp5:
             cached_pool_data = json.loads(resp5.read().decode())
-        if app: app.call_from_thread(app.query_one("#log_feed").write, "   • AlphaPool (Global Metrics)   : 🟢 OK")
+        if app: app.call_from_thread(app.log_msg, "   • AlphaPool (Global Metrics)   : 🟢 OK", "app")
     except Exception:
-        if app: app.call_from_thread(app.query_one("#log_feed").write, "   • AlphaPool (Global Metrics)   : ❌ FAIL")
+        if app: app.call_from_thread(app.log_msg, "   • AlphaPool (Global Metrics)   : ❌ FAIL", "app")
 
     # 5. AlphaPool Personal Wallet Balances
     if WALLET_ADDRESS:
@@ -249,9 +267,9 @@ def fetch_market_data(app=None):
             req6 = urllib.request.Request(f"https://pearl.alphapool.tech/api/miner/{WALLET_ADDRESS}", headers={'User-Agent': 'Mozilla/5.0'})
             with urllib.request.urlopen(req6, timeout=4) as resp6:
                 cached_wallet_data = json.loads(resp6.read().decode())
-            if app: app.call_from_thread(app.query_one("#log_feed").write, "   • AlphaPool (Wallet Ledger)    : 🟢 OK")
+            if app: app.call_from_thread(app.log_msg, "   • AlphaPool (Wallet Ledger)    : 🟢 OK", "app")
         except Exception:
-            if app: app.call_from_thread(app.query_one("#log_feed").write, "   • AlphaPool (Wallet Ledger)    : ❌ FAIL")
+            if app: app.call_from_thread(app.log_msg, "   • AlphaPool (Wallet Ledger)    : ❌ FAIL", "app")
 
     last_api_fetch_time = now
     return cached_wtm_data, cached_btc_usd, cached_historical_btc, cached_pool_data, cached_wallet_data
@@ -333,6 +351,12 @@ def get_historical_metrics(lookback_hours):
 class AlphaMinerTUI(App):
     """Textual Terminal Dashboard Class Engine."""
     
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Filter states for log routing
+        self.errors_only_mode = False
+        self.other_only_mode = False  # Acts as 'App Logs Only' mode
+
     # TCSS - Styling and Visual Container Layout Rules
     CSS = """
     Screen {
@@ -350,7 +374,7 @@ class AlphaMinerTUI(App):
     #app_layout {
         layout: grid;
         grid-size: 1 2;
-        grid-rows: 8fr 2fr;  /* 80% Main Data Cards, 20% Logs at bottom */
+        grid-rows: 85% 15%;  /* 85% Main Data Cards, 15% Logs at bottom */
         height: 100%;
         padding: 0;
     }
@@ -371,7 +395,6 @@ class AlphaMinerTUI(App):
         height: auto;
         color: #EEF1F6;
     }
-    /* Semantic accent borders for structural telemetry categories */
     #miner_dashboard { border-left: tall #00E5FF; }
     #alphapool_global { border-left: tall #3F51B5; }
     #wallet_statistics { border-left: tall #9C27B0; }
@@ -394,16 +417,27 @@ class AlphaMinerTUI(App):
         height: 1;
         text-style: bold;
     }
+    #wallet_row {
+        layout: horizontal;
+        height: auto;
+        width: 100%;
+    }
+    #wallet_statistics { 
+        border-left: tall #9C27B0; 
+        width: 5fr;
+    }
+    #GPU_cell { 
+        border-left: tall #E91E63; 
+        width: 5fr;
+    }
     """
 
-    # Custom Key Bindings Interface
     BINDINGS = [
         Binding(key="q", action="quit", description="Quit App"),             
         Binding(key="*", action="clear_errors", description="Acknowledge Errors - Reset Warning", key_display=""),                
-        Binding(key="-", action="toggle_shares", description="Toggle Share Logs - Show Only Errors", key_display="")
+        Binding(key="-", action="toggle_errors_only", description="Toggle View: Errors Only", key_display=""),
+        Binding(key="+", action="toggle_app_logs_only", description="Toggle View: App Logs Only", key_display="")
     ]
-
-    from textual.widgets import Header, Footer, Static, RichLog  
 
     def compose(self) -> ComposeResult:
         """Assembles structural UI components into the active terminal layout workspace."""
@@ -413,7 +447,9 @@ class AlphaMinerTUI(App):
                 yield Static(id="miner_dashboard", classes="card")
                 yield Static(id="alphapool_global", classes="card")
                 if WALLET_ADDRESS:
-                    yield Static(id="wallet_statistics", classes="card")
+                    with Horizontal(id="wallet_row"):
+                        yield Static(id="wallet_statistics", classes="card")
+                        yield Static(id="GPU_cell", classes="card")
                 yield Static(id="market_ticker", classes="card")
                 yield Static(id="profit_forecast", classes="card")
                 yield Static(id="historical_performance", classes="card")
@@ -425,7 +461,7 @@ class AlphaMinerTUI(App):
 
     def on_mount(self) -> None:
         """Triggers boot file lookups and fires off background tracking loops."""
-        load_history_from_local_file()
+        self.run_worker(lambda: load_history_from_local_file(app=self), thread=True)
         self.run_monitoring_task()
         
     def on_unmount(self) -> None:
@@ -436,68 +472,102 @@ class AlphaMinerTUI(App):
             except Exception:
                 pass    
 
+    def get_view_status_string(self) -> str:
+        """Computes current logging context label for display headers."""
+        if self.errors_only_mode:
+            return "[🛑 ERRORS ONLY]"
+        elif self.other_only_mode:
+            return "[ℹ️ APP LOGS ONLY]"
+        else:
+            return "[🟢 ALL LOGS ACTIVE]"
+
+    def log_msg(self, text: str, category: str = "app") -> None:
+        """Central ingestion portal for app execution records. Drops logs if filters apply."""
+        raw_log_history.append((category, text))
+        
+        if self.errors_only_mode and category != "error":
+            return
+        if self.other_only_mode and category != "app":
+            return
+            
+        try:
+            self.query_one("#log_feed", RichLog).write(text)
+        except Exception:
+            pass
+
     def action_clear_errors(self) -> None:
-        """Bypasses physical keyboard mappings to clear alert counters via the mouse-only button."""
+        """Clears out real-time error aggregators and warnings counters."""
         global total_errors, recent_errors_log
         total_errors = 0
         recent_errors_log.clear()
         
-        share_status = "[⚠️ SHARES MUTED]" if hide_shares_flag else "[🟢 SHARES ACTIVE]"
         self.query_one("#err_title", Static).update(
-            f"🚨 SYSTEM PIPELINE STREAM  •  ✅ 0 Concerns (Operational Stability Nominal)  •  {share_status}"
+            f"🚨 SYSTEM PIPELINE STREAM  •  ✅ 0 Concerns (Operational Stability Nominal)  •  {self.get_view_status_string()}"
         )
         
-    def action_toggle_shares(self) -> None:
-        """Switches logging stream modes and retroactively flushes/filters text display panels."""
-        global hide_shares_flag
-        hide_shares_flag = not hide_shares_flag
-                
-        log_feed = self.query_one("#log_feed", RichLog)
-        log_feed.clear()
-        for is_share, text_line in raw_log_history:
-            if hide_shares_flag and is_share:
-                continue
-            log_feed.write(text_line)    
+    def action_toggle_errors_only(self) -> None:
+        """Switches log pipeline to errors only, disengaging opposite filters."""
+        self.errors_only_mode = not self.errors_only_mode
+        if self.errors_only_mode:
+            self.other_only_mode = False
+        self.refresh_log_display()
+
+    def action_toggle_app_logs_only(self) -> None:
+        """Switches pipeline to look at initialization and API sync rows exclusively (Hides Shares/Errors)."""
+        self.other_only_mode = not self.other_only_mode
+        if self.other_only_mode:
+            self.errors_only_mode = False
+        self.refresh_log_display()
         
     def refresh_log_display(self) -> None:
         """Refreshes the log log widgets when filter toggle triggers are fired."""
-        log_feed = self.query_one("#log_feed", RichLog)
-        log_feed.clear()
-        for is_share, text_line in raw_log_history:
-            if hide_shares_flag and is_share:
-                continue
-            log_feed.write(text_line)
+        try:
+            log_feed = self.query_one("#log_feed", RichLog)
+            log_feed.clear()
+            for log_type, text_line in raw_log_history:
+                if self.errors_only_mode and log_type != "error":
+                    continue
+                if self.other_only_mode and log_type != "app":
+                    continue
+                log_feed.write(text_line)
+        except Exception:
+            pass
 
     @work(thread=True)
     def run_monitoring_task(self) -> None:
-        """Core Threaded Background Engine. Handles logging patterns, API ingestion, and UI mapping."""
+        """Core Background Thread. Coordinates docker hooks, hardware polling, and matrix math."""
         global total_shares, session_shares, total_errors, recent_errors_log, hashrates
         global current_difficulty, last_attempts, last_hits, last_tmac, last_share_equiv_th, share_timestamps
-        global current_hr, avg_hr, avg_pool_equiv, current_w, temp_c, seen_lines, start_time
+        global current_w, temp_c, seen_lines, start_time
         
-        # ───────────────────────────────────────────────────────────────────
-        # ── PHASE 1: PRE-BOOT HISTORICAL BACKLOG INGESTION ──
-        # ───────────────────────────────────────────────────────────────────
         try:
-            time.sleep(0.5) # Let widgets fully stand up before feeding lines
+            time.sleep(0.5)
 
-            self.call_from_thread(self.query_one("#log_feed", RichLog).write, "🔧 Initializing NVML API drivers...")
+            self.call_from_thread(self.log_msg, "🔧 Initializing NVML API drivers...", "app")
             if nvml_enabled:
-                self.call_from_thread(self.query_one("#log_feed", RichLog).write, f"   NVML Status: 🟢 ONLINE ({gpu_name_str})")
+                self.call_from_thread(self.log_msg, f"   NVML Status: 🟢 ONLINE ({gpu_name_str})", "app")
+                try:
+                    current_w = pynvml.nvmlDeviceGetPowerUsage(nvml_handle) / 1000.0
+                    temp_c = pynvml.nvmlDeviceGetTemperature(nvml_handle, pynvml.NVML_TEMPERATURE_GPU)
+                except Exception:
+                    current_w = 165.0
+                    temp_c = 66.0
             else:
-                self.call_from_thread(self.query_one("#log_feed", RichLog).write, "   NVML Status: ❌ OFFLINE")
+                self.call_from_thread(self.log_msg, "   NVML Status: ❌ OFFLINE", "app")
+                current_w = 165.0
+                temp_c = 66.0
 
             if os.path.exists(HISTORY_FILE_NAME):
-                self.call_from_thread(self.query_one("#log_feed", RichLog).write, f"\nℹ️ Found local {HISTORY_FILE_NAME}. Loading parser indices...")
+                self.call_from_thread(self.log_msg, f"\nℹ️ Found local {HISTORY_FILE_NAME}. Loading parser indices...", "app")
             else:
-                self.call_from_thread(self.query_one("#log_feed", RichLog).write, f"\nℹ️ No local {HISTORY_FILE_NAME} found yet. Skipping parser.")
+                self.call_from_thread(self.log_msg, f"\nℹ️ No local {HISTORY_FILE_NAME} found yet. Skipping parser.", "app")
 
-            self.call_from_thread(self.query_one("#log_feed", RichLog).write, f"\n🔄 Phase 1: Contacting Docker Engine and reading recent active container logs...")
+            self.call_from_thread(self.log_msg, f"\n🔄 Phase 1: Contacting Docker Engine and reading recent active container logs...", "app")
 
             history_result = subprocess.run(["docker", "logs", container_name], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="ignore")
             if history_result.returncode == 0:
                 historical_lines = history_result.stdout.splitlines()
-                self.call_from_thread(self.query_one("#log_feed", RichLog).write, f"   Loaded {len(historical_lines):,} lines of container history. Parsing patterns...\n")
+                self.call_from_thread(self.log_msg, f"   Loaded {len(historical_lines):,} lines of container history. Parsing patterns...\n", "app")
                 
                 for line in historical_lines:
                     line = line.strip()
@@ -529,15 +599,14 @@ class AlphaMinerTUI(App):
                         if hashrate_match: hashrates.append(float(hashrate_match.group(1)))
 
                         if parsed_ts:
-                            dashboard_history.append([parsed_ts.timestamp(), last_share_equiv_th, 165.0, float(hashrate_match.group(1)) if hashrate_match else 0.0, 66.0])
+                            dashboard_history.append([parsed_ts.timestamp(), last_share_equiv_th, current_w, float(hashrate_match.group(1)) if hashrate_match else 0.0, temp_c])
 
                     elif "level=ERROR" in clean_line or "level=WARN" in clean_line or "failed" in clean_line.lower():
                         total_errors += 1
                         err_ts = parsed_ts or datetime.now()
                         err_msg = f"❌ {clean_line}"
                         recent_errors_log.append(f"[{err_ts.strftime('%m-%d %H:%M:%S')}] {clean_line}")
-                        raw_log_history.append((False, err_msg))
-                        self.call_from_thread(self.query_one("#log_feed", RichLog).write, err_msg)
+                        self.call_from_thread(self.log_msg, err_msg, "error")
 
                 avg_hr = sum(hashrates) / len(hashrates) if hashrates else 0.0
                 current_hr = hashrates[-1] if hashrates else 0.0
@@ -547,31 +616,54 @@ class AlphaMinerTUI(App):
                 shares_per_min = total_shares / runtime_mins if runtime_mins > 0 else 0.0
                 c_start = start_time.strftime('%Y-%m-%d %H:%M:%S') if start_time else "Unknown"
 
-                self.call_from_thread(self.query_one("#log_feed", RichLog).write, "\n===========================================================================")
-                self.call_from_thread(self.query_one("#log_feed", RichLog).write, f"📊 LOGS SUMMARY (Container start: {c_start})")
-                self.call_from_thread(self.query_one("#log_feed", RichLog).write, f"  • Container Runtime: {runtime_mins:.1f} minutes")
-                self.call_from_thread(self.query_one("#log_feed", RichLog).write, f"  • Cumulative Shares: {total_shares:,} ({shares_per_min:.2f} shares/min)")
-                self.call_from_thread(self.query_one("#log_feed", RichLog).write, f"  • Avg Active Hashrate: {avg_hr:.2f} TH/s")
-                self.call_from_thread(self.query_one("#log_feed", RichLog).write, f"  • Total Memory Logs Tracked: {len(seen_lines):,}")
-                self.call_from_thread(self.query_one("#log_feed", RichLog).write, "===========================================================================\n")
+                # -------------------------------------------------------------------------
+                # 📦 SUMMARY 1: LIVE DOCKER RUNTIME DATA
+                # -------------------------------------------------------------------------
+                self.call_from_thread(self.log_msg, "\n===========================================================================", "app")
+                self.call_from_thread(self.log_msg, f"📊 LIVE DOCKER LOGS SUMMARY (Container Start: {c_start})", "app")
+                self.call_from_thread(self.log_msg, f"  • Active Container Runtime : {runtime_mins:.1f} minutes", "app")
+                self.call_from_thread(self.log_msg, f"  • Current Session Shares   : {total_shares:,} ({shares_per_min:.2f} shares/min)", "app")
+                self.call_from_thread(self.log_msg, f"  • Real-Time Session Hashrate: {avg_hr:.2f} TH/s", "app")
+                self.call_from_thread(self.log_msg, f"  • Live Docker Lines Intercepted : {len(seen_lines):,}", "app")
+                self.call_from_thread(self.log_msg, "===========================================================================", "app")
 
-            self.call_from_thread(self.query_one("#log_feed", RichLog).write, "🔄 Phase 2: Launching main execution matrix loops...\n")
+                # -------------------------------------------------------------------------
+                # 📂 SUMMARY 2: PERMANENT HISTORICAL LOG FILE
+                # -------------------------------------------------------------------------
+                if 'dashboard_history' in globals() or 'dashboard_history' in locals():
+                    total_history_points = len(dashboard_history)
+                    if total_history_points > 0:
+                        # Extract the oldest and newest items in history file memory matrix
+                        oldest_ts = dashboard_history[0][0]
+                        newest_ts = dashboard_history[-1][0]
+                        
+                        history_span_hours = (newest_ts - oldest_ts) / 3600.0
+                        all_historical_hashrates = [row[3] for row in dashboard_history if row[3] > 0]
+                        historical_avg_hr = sum(all_historical_hashrates) / len(all_historical_hashrates) if all_historical_hashrates else 0.0
+                        
+                        self.call_from_thread(self.log_msg, f"📂 HISTORICAL LOG FILE SUMMARY ({HISTORY_FILE_NAME})", "app")
+                        self.call_from_thread(self.log_msg, f"  • Log Storage Profile Range: {history_span_hours:.1f} Total Hours Compiled", "app")
+                        self.call_from_thread(self.log_msg, f"  • Long-Term Historical Speed: {historical_avg_hr:.2f} TH/s Average", "app")
+                        self.call_from_thread(self.log_msg, f"  • Aggregated Database Records: {total_history_points:,} Metrics points mapped", "app")
+                    else:
+                        self.call_from_thread(self.log_msg, f"📂 HISTORICAL LOG FILE SUMMARY: [yellow]Empty or parsing data holds...[/yellow]", "app")
+                    
+                    self.call_from_thread(self.log_msg, "===========================================================================\n", "app")
+
+            self.call_from_thread(self.log_msg, "\n🔄 Phase 2: Launching main execution matrix loops...\n", "app")
 
         except Exception as e:
-            self.call_from_thread(self.query_one("#log_feed", RichLog).write, f"❌ Pre-load Exception: {e}")
+            self.call_from_thread(self.log_msg, f"❌ Pre-load Exception: {e}", "error")
 
         if start_time is None: start_time = datetime.now()
         if len(seen_lines) > 2000: seen_lines = seen_lines[-2000:]
 
-        # ───────────────────────────────────────────────────────────────────
-        # ── PHASE 2: CORE MONITORING LOOP (REAL-TIME POLLING ENGINE) ──
-        # ───────────────────────────────────────────────────────────────────
+        # ── REALTIME MONITORING STREAM POLL LOOP ──
         while self.is_running:
             try:
                 if not self.is_running:
                     break
                     
-                # Scrape trailing docker engine log data increments
                 result = subprocess.run(["docker", "logs", "--tail", "200", container_name], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="ignore")
                 if result.returncode == 0:
                     lines = result.stdout.splitlines()
@@ -596,7 +688,6 @@ class AlphaMinerTUI(App):
                             share_timestamps.append(line_ts)
                             now_track = datetime.now()
                             
-                            elapsed_mins = (now_track - start_time).total_seconds() / 60.0
                             session_elapsed_mins = (now_track - monitor_script_start_time).total_seconds() / 60.0
                             session_shares_per_min = session_shares / max(1 / 60, session_elapsed_mins) if session_elapsed_mins > 0 else 0.0
                             
@@ -608,13 +699,9 @@ class AlphaMinerTUI(App):
                                 last_min_shares_per_min = float(len(share_timestamps))
                             
                             share_msg = f"⏱️ [{line_ts.strftime('%H:%M:%S')}] 🟢 SHARE ACCEPTED! Total: {total_shares} | Last 1m Pace: {last_min_shares_per_min:.2f} shares/min | Session Pace: {session_shares_per_min:.2f} shares/min"
-                            raw_log_history.append((True, share_msg))
-
-                            if not hide_shares_flag:
-                                self.call_from_thread(self.query_one("#log_feed", RichLog).write, share_msg)
+                            self.call_from_thread(self.log_msg, share_msg, "share")
 
                         elif "component=miner status" in clean_line:
-                            # Parse hardware telemetry strings
                             attempts_match = re.search(r"attempts=(\d+)", clean_line)
                             hits_match = re.search(r"hits=(\d+)", clean_line)
                             hashrate_match = re.search(r"hashrate_th_s=([\d.]+)", clean_line)
@@ -622,7 +709,6 @@ class AlphaMinerTUI(App):
                             share_equiv_match = re.search(r"share_equiv_th_s=([\d.]+)", clean_line)
                             share_equiv_tmac_match = re.search(r"share_equiv_tmac_s=([\d.]+)", clean_line)
                             
-                            # Update stream tracker exclusively inside the status block
                             global last_stream_refresh_time
                             last_stream_refresh_time = datetime.now().strftime("%m-%d %H:%M:%S")
                             
@@ -640,34 +726,38 @@ class AlphaMinerTUI(App):
                             total_errors += 1
                             err_msg = f"⚠️ ALERT: {clean_line}"
                             recent_errors_log.append(f"[{line_ts.strftime('%m-%d %H:%M:%S')}] {clean_line}")
-                            raw_log_history.append((False, err_msg))
-                            self.call_from_thread(self.query_one("#log_feed", RichLog).write, err_msg)
+                            self.call_from_thread(self.log_msg, err_msg, "error")
 
-                # Aggregate health title layouts
-                elapsed_mins = (datetime.now() - start_time).total_seconds() / 60.0
-                calculated_stales = max(0, last_hits - total_shares)
-                stale_pct = (calculated_stales / last_hits * 100) if last_hits > 0 else 0.0
                 error_status = "✅ 0 Concerns (Operational Stability Nominal)" if total_errors == 0 else f"🚨 {total_errors} CRITICAL ISSUES DETECTED"
-                share_status = "[⚠️ SHARES MUTED]" if hide_shares_flag else "[🟢 SHARE VIEW ACTIVE]"
-                
                 self.call_from_thread(
                     self.query_one("#err_title", Static).update, 
-                    f"🚨 SYSTEM PIPELINE STREAM  •  {error_status}  •  {share_status}"
+                    f"🚨 SYSTEM PIPELINE STREAM  •  {error_status}  •  {self.get_view_status_string()}"
                 )
 
-                # Poll GPU via NVML bindings
+                gpu_core_mhz = gpu_mem_mhz = gpu_util = cpu_util = 0
                 if nvml_enabled:
                     try:
                         current_w = pynvml.nvmlDeviceGetPowerUsage(nvml_handle) / 1000.0
                         temp_c = pynvml.nvmlDeviceGetTemperature(nvml_handle, pynvml.NVML_TEMPERATURE_GPU)
-                    except Exception: pass
+                        gpu_core_mhz = pynvml.nvmlDeviceGetClockInfo(nvml_handle, pynvml.NVML_CLOCK_GRAPHICS)
+                        gpu_mem_mhz = pynvml.nvmlDeviceGetClockInfo(nvml_handle, pynvml.NVML_CLOCK_MEM)
+                        gpu_util = pynvml.nvmlDeviceGetUtilizationRates(nvml_handle).gpu
+                        
+                        try:
+                            import psutil
+                            cpu_util = int(psutil.cpu_percent())
+                        except ImportError:
+                            cpu_util = int((os.getloadavg()[0] / os.cpu_count()) * 100)
+                            cpu_util = min(100, max(0, cpu_util))
+                    except Exception: 
+                        pass
 
-                # Sync market matrices and parse pricing values
+                # Sync market logs & matrices
                 current_time = datetime.now()
                 api_data, btc_price_usd, historical_btc_map, pool_data, wallet_data = fetch_market_data(self)
                 usd_per_th_day, coin_tag, coin_btc_value, coin_price_usd = 0.0, "PRL", 0.0, 0.0
-                coin_btc_24h, coin_btc_3d, coin_btc_7d = 0.0, 0.0, 0.0
-                coin_usd_24h, coin_usd_3d, coin_usd_7d = 0.0, 0.0, 0.0
+                coin_btc_24h = coin_btc_3d = coin_btc_7d = 0.0
+                coin_usd_24h = coin_usd_3d = coin_usd_7d = 0.0
                 
                 btc_price_24h = historical_btc_map["1d"]
                 btc_price_3d = historical_btc_map["3d"]
@@ -699,8 +789,8 @@ class AlphaMinerTUI(App):
                         base_revenue = wtm_daily_revenue_usd * scaling_factor
                         usd_per_th_day = base_revenue / 153.0
 
-                pool_hash_th, network_hash_th, pool_percentage = 0.0, 0.0, 0.0
-                active_miners, active_workers, blocks_24h = 0, 0, 0
+                pool_hash_th = network_hash_th = pool_percentage = 0.0
+                active_miners = active_workers = blocks_24h = 0
                 if pool_data and isinstance(pool_data, dict):
                     try:
                         p_stats = pool_data.get('pool', {})
@@ -713,7 +803,8 @@ class AlphaMinerTUI(App):
                         blocks_24h = int(p_stats.get('blocks24h', pool_data.get('blocks24h', 0)))
                     except Exception: pass
 
-                balance_prl, total_paid_prl, balance_usd, total_paid_usd, payments_by_day = 0.0, 0.0, 0.0, 0.0, []
+                balance_prl = total_paid_prl = balance_usd = total_paid_usd = 0.0
+                payments_by_day = []
                 if WALLET_ADDRESS and wallet_data and isinstance(wallet_data, dict):
                     try:
                         balance_prl = float(wallet_data.get('balance_prl', 0.0))
@@ -729,7 +820,6 @@ class AlphaMinerTUI(App):
                 else:
                     rev_hour = rev_day = rev_week = rev_month = 0.0
                 
-                # Compute power projection formulas
                 current_rate = get_kwh_rate(current_time)
                 cost_hour = (current_w / 1000.0) * current_rate
                 cost_day = project_future_cost(current_time, current_w, 24)
@@ -748,17 +838,16 @@ class AlphaMinerTUI(App):
                 else:
                     session_avg_pool, session_avg_w, session_avg_hr, session_avg_temp = last_share_equiv_th, current_w, current_hr, temp_c
 
-                # ───────────────────────────────────────────────────────────
-                # ── PHASE 3: INTERFACE CARD PRESENTATION COMPILATION ──
-                # ───────────────────────────────────────────────────────────
-                
-                # Card 1: Dashboard Primary Telemetry
+                elapsed_mins = (datetime.now() - start_time).total_seconds() / 60.0
+                calculated_stales = max(0, last_hits - total_shares)
+                stale_pct = (calculated_stales / last_hits * 100) if last_hits > 0 else 0.0
+
+                # ── CARD 1: DASHBOARD TELEMETRY ──
                 dash_text = (
                     f"📊 [bold #00E5FF]MINER TELEMETRY SYSTEM[/bold #00E5FF]  ⏱️ Total Uptime: [cyan]{int(elapsed_mins//60)}h {int(elapsed_mins%60)}m[/cyan] • "
                     f"Last Status At: [cyan]{last_stream_refresh_time}[/cyan]\n"
                     f"  ⚒️ Network Difficulty: [white]{current_difficulty}[/white]\n"
                     f"  ⚡ Hardware Speed : [spring_green3]{current_hr:.2f} TH/s[/spring_green3] (Moving Avg: {avg_hr:.2f} TH/s | Session Avg: {session_avg_hr:.2f} TH/s)\n"
-                    f"  🔌 Power & Thermal: [orange1]{current_w:.1f}W @ {temp_c}°C[/orange1] (Session Avg: {session_avg_w:.1f}W @ {session_avg_temp:.1f}°C) | Engine: [grey62]{gpu_name_str}[/grey62]\n"
                     f"  🌍 Pool Efficiency: [turquoise2]{last_share_equiv_th:.2f} TH/s[/turquoise2] (Moving Avg: {avg_pool_equiv:.2f} TH/s | Session Avg: {session_avg_pool:.2f} TH/s)\n"
                     f"  🎲 Work Ratios    : Attempts: {last_attempts} | Total Hits: {last_hits}\n"
                     f"  ⏳ Stale/Lag Rate : [bright_red]{calculated_stales} stale shares ({stale_pct:.2f}%)[/bright_red]\n"
@@ -771,7 +860,7 @@ class AlphaMinerTUI(App):
                     dash_text += f"  🌐 Financial Data  : Next API pull cycle imminent"
                 self.call_from_thread(self.query_one("#miner_dashboard", Static).update, dash_text)
 
-                # Card 2: AlphaPool Network Metrics
+                # ── CARD 2: ALPHAPOOL GLOBAL METRICS ──
                 g_text = f"🌊 [bold #5C6BC0]ALPHAPOOL GLOBAL STATISTICS[/bold #5C6BC0]\n"
                 if pool_data:
                     g_text += (
@@ -780,11 +869,27 @@ class AlphaMinerTUI(App):
                         f"  • Participation       : [white]{active_miners:,}[/white] Miners online  |  [white]{active_workers:,}[/white] Workers active\n"
                         f"  • Block Production    : [spring_green3]{blocks_24h}[/spring_green3] Blocks discovered in past 24h"
                     )
+                    
+                    recent_blocks = pool_data.get('recentBlocks', [])
+                    if recent_blocks and len(recent_blocks) > 0:
+                        latest_block = recent_blocks[0]
+                        raw_unix = float(latest_block.get('time', 0))
+                        if raw_unix > 0:
+                            local_tz = datetime.now().astimezone().tzinfo
+                            local_time = datetime.fromtimestamp(raw_unix, tz=local_tz)
+                            full_tz_name = local_time.strftime('%Z')
+                            tz_abbreviation = "".join([char for char in full_tz_name if char.isupper()]) if len(full_tz_name) > 5 else full_tz_name
+                            formatted_time = local_time.strftime(f'%Y-%m-%d %I:%M:%S %p {tz_abbreviation}')
+                        else:
+                            formatted_time = "Unknown"
+                            
+                        block_amount = latest_block.get('amount', 0.0)
+                        g_text += f"\n  • Last Block Found    : [yellow]{formatted_time}[/yellow]  |  Amount: [cyan]{block_amount} {coin_tag}[/cyan]"
                 else:
-                    g_text += f"  • status: [grey50]Syncing node network data feeds...[/grey50]"
+                    g_text += f"  • status: [grey50]Syncing node network data feeds...[/grey50]" 
                 self.call_from_thread(self.query_one("#alphapool_global", Static).update, g_text)
 
-                # Card 3: Wallet Inflow Allocations
+                # ── CARD 3: WALLET SUMMARY ──
                 if WALLET_ADDRESS:
                     w_text = f"💼 [bold #BA68C8]WALLET BALANCE AND TRANSACTION LEDGER[/bold #BA68C8]\n"
                     if wallet_data:
@@ -800,7 +905,7 @@ class AlphaMinerTUI(App):
                             )
                         if payments_by_day:
                             w_text += f"\n  • Recent Automated Distributions:"
-                            for item in payments_by_day[:4][::-1]:
+                            for item in payments_by_day[-4:][::-1]:
                                 amt_prl = float(item.get('amount_prl', 0.0))
                                 if btc_price_usd is not None:
                                     amt_usd = amt_prl * coin_price_usd
@@ -810,8 +915,27 @@ class AlphaMinerTUI(App):
                     else:
                         w_text += "  • status: [grey50]Querying public key ledger balances...[/grey50]"
                     self.call_from_thread(self.query_one("#wallet_statistics", Static).update, w_text)
+                    
+                # ── CARD 3B: VIDEO TELEMETRY ──
+                if WALLET_ADDRESS:
+                    hw_text = (
+                        f"🔌 [bold #E91E63]GPU HARDWARE TELEMETRY[/bold #E91E63]\n"
+                        f"  • Engine Device   : [grey62]{gpu_name_str}[/grey62]\n"
+                        f"  • Power Profile   : [orange1]{current_w:.1f}W[/orange1] (Session Avg: {session_avg_w:.1f}W)\n"
+                        f"  • Thermal Core    : [orange1]{temp_c}°C[/orange1] (Session Avg: {session_avg_temp:.1f}°C)\n"
+                    )
+                    if nvml_enabled:
+                        hw_text += (
+                            f"  • Graphics Clock  : [spring_green3]{gpu_core_mhz} MHz[/spring_green3]\n"
+                            f"  • Memory Clock    : [spring_green3]{gpu_mem_mhz} MHz[/spring_green3]\n"
+                            f"  • GPU Utilization : [orange1]{gpu_util}%[/orange1]\n"
+                            f"  • CPU Utilization : [orange1]{cpu_util}%[/orange1]"
+                        )
+                    else:
+                        hw_text += f"  • Clock Telemetry : [bright_red]NVML OFFLINE[/bright_red]\n"
+                    self.call_from_thread(self.query_one("#GPU_cell", Static).update, hw_text)   
 
-                # Card 4: Financial Asset Ticker
+                # ── CARD 4: ASSET TICKER ──
                 t_text = f"📈 [bold #FFB74D]MARKET TICKER & ASSET PRICE COEFFICIENTS[/bold #FFB74D]\n"
                 if btc_price_usd is not None:
                     t_text += (
@@ -821,12 +945,10 @@ class AlphaMinerTUI(App):
                         f"  • 7-Day Average :  ₿ BTC: ${btc_price_7d:,.2f}  |  🦪 1 {coin_tag}: {coin_btc_7d:.8f} BTC (${coin_usd_7d:.4f} USD)"
                     )
                 else:
-                    t_text += (
-                        f"  • Spot Live     :  ₿ BTC: \\[EXCHANGE OFFLINE\\]  |  🦪 {coin_tag}: \\[EXCHANGE OFFLINE\\]"
-                    )
+                    t_text += f"  • Spot Live     :  ₿ BTC: \\[EXCHANGE OFFLINE\\]  |  🦪 {coin_tag}: \\[EXCHANGE OFFLINE\\]"
                 self.call_from_thread(self.query_one("#market_ticker", Static).update, t_text)
 
-                # Card 5: Real-time Profit Projections
+                # ── CARD 5: REVENUE YIELD PROJECTIONS ──
                 f_text = f"💰 [bold #81C784]REAL-TIME ESTIMATED PROFIT FORECAST[/bold #81C784]  ⚡ [grey62]Rate: ${current_rate:.3f}/kWh ({'Time-of-Use' if USE_TIME_OF_USE else 'Static'})[/grey62]\n"
                 if btc_price_usd is not None and usd_per_th_day > 0:
                     f_text += (
@@ -841,7 +963,7 @@ class AlphaMinerTUI(App):
                     )
                 self.call_from_thread(self.query_one("#profit_forecast", Static).update, f_text)
 
-                # Card 6: Historical Yield Performance
+                # ── CARD 6: RECOVERY ACTUALS ──
                 p_text = f"📈 [bold #4DB6AC]HISTORICAL REALIZED PERFORMANCE LOGS[/bold #4DB6AC]\n"
                 if btc_price_usd is not None and usd_per_th_day > 0:
                     p_text += (
@@ -849,14 +971,12 @@ class AlphaMinerTUI(App):
                         f"  • Past 24 Hours: Gross: [grey62]${rev_24h:.2f}[/grey62]  | Elec Cost: [bright_red]${cost_24h:.2f}[/bright_red]  | Actual Net: [spring_green3]{'+' if prof_24h>=0 else ''}${prof_24h:.2f}[/spring_green3]"
                     )
                 else:
-                    p_text += (
-                        f"  • Past 24 Hours: Gross: \\[LOG SYNC ERR\\] | Elec Cost: ${cost_24h:.2f} | Actual Net: \\[LOG SYNC ERR\\]"
-                    )
+                    p_text += f"  • Past 24 Hours: Gross: \\[LOG SYNC ERR\\] | Elec Cost: ${cost_24h:.2f} | Actual Net: \\[LOG SYNC ERR\\]"
                 self.call_from_thread(self.query_one("#historical_performance", Static).update, p_text)
-
+                              
             except Exception:
                 pass
-            time.sleep(1) # Frequency floor separator loop pacing block
+            time.sleep(1)
 
 
 if __name__ == "__main__":
