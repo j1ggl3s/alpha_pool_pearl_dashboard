@@ -466,7 +466,8 @@ class AlphaMinerTUI(App):
 
     def on_mount(self) -> None:
         """Triggers boot file lookups and fires off background tracking loops."""
-        self.run_worker(lambda: load_history_from_local_file(app=self), thread=True)
+        load_history_from_local_file(app=self)
+        # self.run_worker(lambda: load_history_from_local_file(app=self), thread=True)
         self.run_monitoring_task()
         
     def on_unmount(self) -> None:
