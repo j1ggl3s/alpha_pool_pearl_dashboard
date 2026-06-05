@@ -155,7 +155,7 @@ def load_history_from_local_file(app=None):
     target_file = "persistent_miner.log"
     
     if not os.path.exists(target_file):
-        ui_log(f"❌ [Phase 1] Critical error: File '{target_file}' not found!")
+        #ui_log(f"❌ [Phase 1] Critical error: File '{target_file}' not found!")
         return
         
     ansi_cleaner_regex = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])|\[\d+(?:\;\d+)?m")
@@ -185,8 +185,8 @@ def load_history_from_local_file(app=None):
         last_hr = float(match.group(4))
         last_se = float(match.group(5))
         
-        c_w = 103.2  
-        t_c = 53.0
+        c_w = 0.0  
+        t_c = 0.0
         
         try:
             from datetime import datetime
@@ -630,7 +630,10 @@ class AlphaMinerTUI(App):
                 # -------------------------------------------------------------------------
                 # 📂 SUMMARY 2: PERMANENT HISTORICAL LOG FILE
                 # -------------------------------------------------------------------------
-                if 'dashboard_history' in globals() or 'dashboard_history' in locals():
+                
+
+                # Ensure the file exists before checking memory or printing summaries
+                if os.path.exists(HISTORY_FILE_NAME) and ('dashboard_history' in globals() or 'dashboard_history' in locals()):
                     total_history_points = len(dashboard_history)
                     if total_history_points > 0:
                         # Extract the oldest and newest items in history file memory matrix
@@ -638,17 +641,23 @@ class AlphaMinerTUI(App):
                         newest_ts = dashboard_history[-1][0]
                         
                         history_span_hours = (newest_ts - oldest_ts) / 3600.0
-                        all_historical_hashrates = [row[3] for row in dashboard_history if row[3] > 0]
+                        
+                        # 🟢 FIX: Hardware Hashrate is now located at row[2] instead of row[3]
+                        all_historical_hashrates = [row[2] for row in dashboard_history if row[2] > 0]
                         historical_avg_hr = sum(all_historical_hashrates) / len(all_historical_hashrates) if all_historical_hashrates else 0.0
                         
                         self.call_from_thread(self.log_msg, f"📂 HISTORICAL LOG FILE SUMMARY ({HISTORY_FILE_NAME})", "app")
                         self.call_from_thread(self.log_msg, f"  • Log Storage Profile Range: {history_span_hours:.1f} Total Hours Compiled", "app")
                         self.call_from_thread(self.log_msg, f"  • Long-Term Historical Speed: {historical_avg_hr:.2f} TH/s Average", "app")
                         self.call_from_thread(self.log_msg, f"  • Aggregated Database Records: {total_history_points:,} Metrics points mapped", "app")
+                        
+                        # Only print the closing box border line if the summary was printed
+                        self.call_from_thread(self.log_msg, "===========================================================================\n", "app")
                     else:
-                        self.call_from_thread(self.log_msg, f"📂 HISTORICAL LOG FILE SUMMARY: [yellow]Empty or parsing data holds...[/yellow]", "app")
-                    
-                    self.call_from_thread(self.log_msg, "===========================================================================\n", "app")
+                        # Optional: uncomment if you want a notification when the file exists but hasn't finished reading yet
+                        # self.call_from_thread(self.log_msg, f"📂 HISTORICAL LOG FILE SUMMARY: [yellow]Empty or parsing data holds...[/yellow]", "app")
+                        # self.call_from_thread(self.log_msg, "===========================================================================\n", "app")
+                        pass
 
             self.call_from_thread(self.log_msg, "\n🔄 Phase 2: Launching main execution matrix loops...\n", "app")
 
