@@ -152,7 +152,7 @@ def load_history_from_local_file(app=None):
 
     #ui_log("⚙️ [Phase 1] Processing historical log file records...")
     
-    target_file = HISTORY_FILE_NAME
+    target_file = "persistent_miner.log"
     
     if not os.path.exists(target_file):
         #ui_log(f"❌ [Phase 1] Critical error: File '{target_file}' not found!")
@@ -185,12 +185,13 @@ def load_history_from_local_file(app=None):
         last_hr = float(match.group(4))
         last_se = float(match.group(5))
         
+        c_w = 0.0  
+        t_c = 0.0
+        
         try:
             from datetime import datetime
             dt_parsed = datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
-            # Historical log files do not contain watt/temp telemetry.
-            # Store None so historical summaries do not treat missing hardware data as real readings.
-            temp_history_stack.append([dt_parsed.timestamp(), last_se, None, last_hr, None])
+            temp_history_stack.append([dt_parsed.timestamp(), last_se, c_w, last_hr, t_c])
             match_count += 1
         except Exception:
             pass
@@ -339,16 +340,10 @@ def get_historical_metrics(lookback_hours):
     usd_per_th_day = base_revenue / 153.0
 
     hist_rev = hist_avg_hr * usd_per_th_day * (active_mining_hours / 24.0)
-
-    # Only live NVML samples have wattage. Historical Docker/persistent logs do not.
-    # This prevents missing watt values from being treated as real 0W/165W readings.
-    power_entries = [e for e in valid_entries if e[2] is not None and e[2] > 0]
-    if not power_entries:
-        hist_cost = 0.0
-    elif not USE_TIME_OF_USE:
-        hist_cost = (sum(e[2] for e in power_entries) / len(power_entries) / 1000.0) * STATIC_KWH_RATE * active_mining_hours
+    if not USE_TIME_OF_USE:
+        hist_cost = (sum(e[2] for e in valid_entries) / len(valid_entries) / 1000.0) * STATIC_KWH_RATE * active_mining_hours
     else:
-        avg_hourly_cost = sum((e[2] / 1000.0) * get_kwh_rate(datetime.fromtimestamp(e[0])) for e in power_entries) / len(power_entries)
+        avg_hourly_cost = sum((e[2] / 1000.0) * get_kwh_rate(datetime.fromtimestamp(e[0])) for e in valid_entries) / len(valid_entries)
         hist_cost = avg_hourly_cost * active_mining_hours
     return hist_rev, hist_cost, (hist_rev - hist_cost)
 
@@ -451,10 +446,9 @@ class AlphaMinerTUI(App):
             with ScrollableContainer(id="main_scroll"):
                 yield Static(id="miner_dashboard", classes="card")
                 yield Static(id="alphapool_global", classes="card")
-                if WALLET_ADDRESS:
-                    with Horizontal(id="wallet_row"):
-                        yield Static(id="wallet_statistics", classes="card")
-                        yield Static(id="GPU_cell", classes="card")
+                with Horizontal(id="wallet_row"):
+                    yield Static(id="wallet_statistics", classes="card")
+                    yield Static(id="GPU_cell", classes="card")
                 yield Static(id="market_ticker", classes="card")
                 yield Static(id="profit_forecast", classes="card")
                 yield Static(id="historical_performance", classes="card")
@@ -467,7 +461,7 @@ class AlphaMinerTUI(App):
     def on_mount(self) -> None:
         """Triggers boot file lookups and fires off background tracking loops."""
         load_history_from_local_file(app=self)
-        # self.run_worker(lambda: load_history_from_local_file(app=self), thread=True)
+        #self.run_worker(lambda: load_history_from_local_file(app=self), thread=True)
         self.run_monitoring_task()
         
     def on_unmount(self) -> None:
@@ -556,12 +550,12 @@ class AlphaMinerTUI(App):
                     current_w = pynvml.nvmlDeviceGetPowerUsage(nvml_handle) / 1000.0
                     temp_c = pynvml.nvmlDeviceGetTemperature(nvml_handle, pynvml.NVML_TEMPERATURE_GPU)
                 except Exception:
-                    current_w = 0.0
-                    temp_c = 0.0
+                    current_w = 165.0
+                    temp_c = 66.0
             else:
                 self.call_from_thread(self.log_msg, "   NVML Status: ❌ OFFLINE", "app")
-                current_w = 0.0
-                temp_c = 0.0
+                current_w = 165.0
+                temp_c = 66.0
 
             if os.path.exists(HISTORY_FILE_NAME):
                 self.call_from_thread(self.log_msg, f"\nℹ️ Found local {HISTORY_FILE_NAME}. Loading parser indices...", "app")
@@ -605,9 +599,7 @@ class AlphaMinerTUI(App):
                         if hashrate_match: hashrates.append(float(hashrate_match.group(1)))
 
                         if parsed_ts:
-                            # Startup Docker history does not contain watt/temp telemetry.
-                            # Store None for those fields; live polling will add real NVML readings later.
-                            dashboard_history.append([parsed_ts.timestamp(), last_share_equiv_th, None, float(hashrate_match.group(1)) if hashrate_match else 0.0, None])
+                            dashboard_history.append([parsed_ts.timestamp(), last_share_equiv_th, current_w, float(hashrate_match.group(1)) if hashrate_match else 0.0, temp_c])
 
                     elif "level=ERROR" in clean_line or "level=WARN" in clean_line or "failed" in clean_line.lower():
                         total_errors += 1
@@ -650,8 +642,8 @@ class AlphaMinerTUI(App):
                         
                         history_span_hours = (newest_ts - oldest_ts) / 3600.0
                         
-                        # 🟢 FIX: Hardware Hashrate is stored at row[3]; row[2] is live wattage when available
-                        all_historical_hashrates = [row[3] for row in dashboard_history if row[3] > 0]
+                        # 🟢 FIX: Hardware Hashrate is now located at row[2] instead of row[3]
+                        all_historical_hashrates = [row[2] for row in dashboard_history if row[2] > 0]
                         historical_avg_hr = sum(all_historical_hashrates) / len(all_historical_hashrates) if all_historical_hashrates else 0.0
                         
                         self.call_from_thread(self.log_msg, f"📂 HISTORICAL LOG FILE SUMMARY ({HISTORY_FILE_NAME})", "app")
@@ -849,12 +841,9 @@ class AlphaMinerTUI(App):
                 if dashboard_history:
                     total_logs = len(dashboard_history)
                     session_avg_pool = sum(e[1] for e in dashboard_history) / total_logs
+                    session_avg_w = sum(e[2] for e in dashboard_history) / total_logs
                     session_avg_hr = sum(e[3] for e in dashboard_history) / total_logs
-
-                    live_power_samples = [e[2] for e in dashboard_history if e[2] is not None and e[2] > 0]
-                    live_temp_samples = [e[4] for e in dashboard_history if e[4] is not None and e[4] > 0]
-                    session_avg_w = sum(live_power_samples) / len(live_power_samples) if live_power_samples else current_w
-                    session_avg_temp = sum(live_temp_samples) / len(live_temp_samples) if live_temp_samples else temp_c
+                    session_avg_temp = sum(e[4] for e in dashboard_history) / total_logs
                 else:
                     session_avg_pool, session_avg_w, session_avg_hr, session_avg_temp = last_share_equiv_th, current_w, current_hr, temp_c
 
@@ -910,50 +899,55 @@ class AlphaMinerTUI(App):
                 self.call_from_thread(self.query_one("#alphapool_global", Static).update, g_text)
 
                 # ── CARD 3: WALLET SUMMARY ──
-                if WALLET_ADDRESS:
-                    w_text = f"💼 [bold #BA68C8]WALLET BALANCE AND TRANSACTION LEDGER[/bold #BA68C8]\n"
-                    if wallet_data:
-                        if btc_price_usd is not None:
-                            w_text += (
-                                f"  • Pending Balance     : [#00FF7F]{balance_prl:.8f} {coin_tag}[/#00FF7F] (${balance_usd:.2f} USD)\n"
-                                f"  • Total Accum. Paid   : [white]{total_paid_prl:.8f} {coin_tag}[/white] (${total_paid_usd:.2f} USD)"
-                            )
-                        else:
-                            w_text += (
-                                f"  • Pending Balance     : {balance_prl:.8f} {coin_tag} (\\[API TIMEOUT\\])\n"
-                                f"  • Total Accum. Paid   : {total_paid_prl:.8f} {coin_tag} (\\[API TIMEOUT\\])"
-                            )
-                        if payments_by_day:
-                            w_text += f"\n  • Recent Automated Distributions:"
-                            for item in payments_by_day[-4:][::-1]:
-                                amt_prl = float(item.get('amount_prl', 0.0))
-                                if btc_price_usd is not None:
-                                    amt_usd = amt_prl * coin_price_usd
-                                    w_text += f"\n    - {item.get('day', 'Unknown')} : {amt_prl:.4f} {coin_tag} (${amt_usd:.2f} USD)"
-                                else:
-                                    w_text += f"\n    - {item.get('day', 'Unknown')} : {amt_prl:.4f} {coin_tag} (\\Delta API OFFLINE)"
-                    else:
-                        w_text += "  • status: [grey50]Querying public key ledger balances...[/grey50]"
-                    self.call_from_thread(self.query_one("#wallet_statistics", Static).update, w_text)
-                    
-                # ── CARD 3B: VIDEO TELEMETRY ──
-                if WALLET_ADDRESS:
-                    hw_text = (
-                        f"🔌 [bold #E91E63]GPU HARDWARE TELEMETRY[/bold #E91E63]\n"
-                        f"  • Engine Device   : [grey62]{gpu_name_str}[/grey62]\n"
-                        f"  • Power Profile   : [orange1]{current_w:.1f}W[/orange1] (Session Avg: {session_avg_w:.1f}W)\n"
-                        f"  • Thermal Core    : [orange1]{temp_c}°C[/orange1] (Session Avg: {session_avg_temp:.1f}°C)\n"
+                w_text = f"💼 [bold #BA68C8]WALLET BALANCE AND TRANSACTION LEDGER[/bold #BA68C8]\n"
+                if not WALLET_ADDRESS:
+                    w_text += (
+                        "  • Wallet Address      : [grey50]Not configured[/grey50]\n"
+                        "  • Pending Balance     : [grey50]Not available[/grey50]\n"
+                        "  • Total Accum. Paid   : [grey50]Not available[/grey50]\n"
+                        "  • Recent Distributions: [grey50]Not available[/grey50]"
                     )
-                    if nvml_enabled:
-                        hw_text += (
-                            f"  • Graphics Clock  : [spring_green3]{gpu_core_mhz} MHz[/spring_green3]\n"
-                            f"  • Memory Clock    : [spring_green3]{gpu_mem_mhz} MHz[/spring_green3]\n"
-                            f"  • GPU Utilization : [orange1]{gpu_util}%[/orange1]\n"
-                            f"  • CPU Utilization : [orange1]{cpu_util}%[/orange1]"
+                elif wallet_data:
+                    if btc_price_usd is not None:
+                        w_text += (
+                            f"  • Pending Balance     : [#00FF7F]{balance_prl:.8f} {coin_tag}[/#00FF7F] (${balance_usd:.2f} USD)\n"
+                            f"  • Total Accum. Paid   : [white]{total_paid_prl:.8f} {coin_tag}[/white] (${total_paid_usd:.2f} USD)"
                         )
                     else:
-                        hw_text += f"  • Clock Telemetry : [bright_red]NVML OFFLINE[/bright_red]\n"
-                    self.call_from_thread(self.query_one("#GPU_cell", Static).update, hw_text)   
+                        w_text += (
+                            f"  • Pending Balance     : {balance_prl:.8f} {coin_tag} (\\[API TIMEOUT\\])\n"
+                            f"  • Total Accum. Paid   : {total_paid_prl:.8f} {coin_tag} (\\[API TIMEOUT\\])"
+                        )
+                    if payments_by_day:
+                        w_text += f"\n  • Recent Automated Distributions:"
+                        for item in payments_by_day[-4:][::-1]:
+                            amt_prl = float(item.get('amount_prl', 0.0))
+                            if btc_price_usd is not None:
+                                amt_usd = amt_prl * coin_price_usd
+                                w_text += f"\n    - {item.get('day', 'Unknown')} : {amt_prl:.4f} {coin_tag} (${amt_usd:.2f} USD)"
+                            else:
+                                w_text += f"\n    - {item.get('day', 'Unknown')} : {amt_prl:.4f} {coin_tag} (\\Delta API OFFLINE)"
+                else:
+                    w_text += "  • status: [grey50]Querying public key ledger balances...[/grey50]"
+                self.call_from_thread(self.query_one("#wallet_statistics", Static).update, w_text)
+                    
+                # ── CARD 3B: VIDEO TELEMETRY ──
+                hw_text = (
+                    f"🔌 [bold #E91E63]GPU HARDWARE TELEMETRY[/bold #E91E63]\n"
+                    f"  • Engine Device   : [grey62]{gpu_name_str}[/grey62]\n"
+                    f"  • Power Profile   : [orange1]{current_w:.1f}W[/orange1] (Session Avg: {session_avg_w:.1f}W)\n"
+                    f"  • Thermal Core    : [orange1]{temp_c}°C[/orange1] (Session Avg: {session_avg_temp:.1f}°C)\n"
+                )
+                if nvml_enabled:
+                    hw_text += (
+                        f"  • Graphics Clock  : [spring_green3]{gpu_core_mhz} MHz[/spring_green3]\n"
+                        f"  • Memory Clock    : [spring_green3]{gpu_mem_mhz} MHz[/spring_green3]\n"
+                        f"  • GPU Utilization : [orange1]{gpu_util}%[/orange1]\n"
+                        f"  • CPU Utilization : [orange1]{cpu_util}%[/orange1]"
+                    )
+                else:
+                    hw_text += f"  • Clock Telemetry : [bright_red]NVML OFFLINE[/bright_red]\n"
+                self.call_from_thread(self.query_one("#GPU_cell", Static).update, hw_text)   
 
                 # ── CARD 4: ASSET TICKER ──
                 t_text = f"📈 [bold #FFB74D]MARKET TICKER & ASSET PRICE COEFFICIENTS[/bold #FFB74D]\n"
