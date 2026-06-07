@@ -33,6 +33,22 @@ container_name = "alpha-miner"
 # Local text log file used to cache historical hardware data between dashboard restarts.
 HISTORY_FILE_NAME = "persistent_miner.log"
 
+# LOCAL PERSISTENT LOG FILE LOADING SWITCH:
+#
+# Set to True to scan HISTORY_FILE_NAME on startup and fold the saved file-log history
+# into the dashboard's historical summaries, total logging averages, shares/min,
+# and historical line/share counts.
+#
+# Set to False to completely skip local file-log loading.
+# When False, the program will NOT check whether HISTORY_FILE_NAME exists,
+# will NOT read persistent_miner.log, and will only use Docker history +
+# the current live monitoring session for startup/session averages.
+#
+# Recommended:
+#   True  = normal long-term tracking mode
+#   False = portable/live-only mode, faster startup, or if no persistent log file is used
+USE_PERSISTENT_LOG_FILE = False
+
 # Public key address used to pull pool-side worker shares, balances, and payment metrics.
 WALLET_ADDRESS = ""
 
@@ -58,10 +74,23 @@ WTM_PROFIT_OFFSET_PCT = 15.0
 dashboard_history = []
 total_shares = 0
 session_shares = 0
+total_candidates = 0
+session_candidates = 0
+historical_lines_read = 0
+historical_submitted_shares = 0
+historical_candidate_shares = 0
+historical_shares_per_min = 0.0
+historical_records_loaded = 0
 total_errors = 0
 recent_errors_log = []  
 hashrates = []
 current_difficulty = "[red]\\[FETCHING...\\][/red]"
+difficulty_mode = "VarDiff"
+session_difficulties = []
+stratum_endpoint = "Detecting stratum..."
+miner_image = "Detecting miner image..."
+miner_name = "Detecting miner..."
+miner_version = "Detecting version..."
 last_attempts = 0
 last_hits = 0
 last_tmac = 0.0
@@ -134,70 +163,85 @@ def project_future_cost(start_dt, wattage, total_hours):
     return total_cost
 
 def load_history_from_local_file(app=None):
-    global dashboard_history
+    """Load the full persistent miner log from disk and build historical metrics from the actual file."""
+    global dashboard_history, historical_lines_read, historical_submitted_shares
+    global historical_candidate_shares, historical_shares_per_min, historical_records_loaded
     
-    # 📢 Helper to log to the UI safely based on whether we are in a background worker or main thread
+    if not USE_PERSISTENT_LOG_FILE:
+            return
+
     def ui_log(msg, channel="app"):
         if app:
             try:
-                # If we are in a background worker, use call_from_thread
                 import threading
-                if app._thread_id != threading.get_ident():
+                if getattr(app, "_thread_id", None) != threading.get_ident():
                     app.call_from_thread(app.log_msg, msg, channel)
                 else:
-                    # If we are running directly on the main thread, call it natively
                     app.log_msg(msg, channel)
             except Exception:
                 pass
 
-    #ui_log("⚙️ [Phase 1] Processing historical log file records...")
-    
-    target_file = "persistent_miner.log"
-    
+    target_file = HISTORY_FILE_NAME
+    dashboard_history = []
+    historical_lines_read = 0
+    historical_submitted_shares = 0
+    historical_candidate_shares = 0
+    historical_shares_per_min = 0.0
+    historical_records_loaded = 0
+
     if not os.path.exists(target_file):
-        #ui_log(f"❌ [Phase 1] Critical error: File '{target_file}' not found!")
         return
-        
+
     ansi_cleaner_regex = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])|\[\d+(?:\;\d+)?m")
-    
-    # 🎯 Match exact status pattern groups directly from the continuous line stream
     status_block_regex = re.compile(
-        r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z).*?component=miner status attempts=(\d+) hits=(\d+)\s+hashrate_th_s=([\d.]+).*?share_equiv_th_s=([\d.]+)"
+        r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z).*?component=miner\s+status\s+attempts=(\d+)\s+hits=(\d+)\s+hashrate_th_s=([\d.]+).*?share_equiv_th_s=([\d.]+)"
     )
+
+    first_ts = None
+    last_ts = None
+    temp_history_stack = []
 
     try:
         with open(target_file, "r", errors="ignore") as f:
-            raw_content = f.read()
-        #ui_log(f"大 [Phase 1] Log file found. Loaded {len(raw_content):,} characters.")
+            for raw_line in f:
+                historical_lines_read += 1
+                clean_line = ansi_cleaner_regex.sub("", raw_line).replace("[entrypoint] ", "").strip()
+                if not clean_line:
+                    continue
+
+                parsed_ts = parse_timestamp(clean_line)
+                if parsed_ts:
+                    if first_ts is None:
+                        first_ts = parsed_ts
+                    last_ts = parsed_ts
+
+                if "component=share" in clean_line and "found_candidate" in clean_line:
+                    historical_candidate_shares += 1
+                if "component=share" in clean_line and "submitted" in clean_line:
+                    historical_submitted_shares += 1
+
+                match = status_block_regex.search(clean_line)
+                if match:
+                    try:
+                        dt_parsed = datetime.fromisoformat(match.group(1).replace("Z", "+00:00"))
+                        last_hr = float(match.group(4))
+                        last_se = float(match.group(5))
+
+                        # The miner log does not contain NVML telemetry. Do not store fake zeroes.
+                        c_w = current_w if current_w and current_w > 0 else None
+                        t_c = temp_c if temp_c and temp_c > 0 else None
+                        temp_history_stack.append([dt_parsed.timestamp(), last_se, c_w, last_hr, t_c])
+                    except Exception:
+                        pass
+
+        dashboard_history = temp_history_stack[-10000:]
+        historical_records_loaded = len(dashboard_history)
+        if first_ts and last_ts and last_ts > first_ts:
+            span_m = (last_ts - first_ts).total_seconds() / 60.0
+            historical_shares_per_min = historical_submitted_shares / span_m if span_m > 0 else 0.0
     except Exception as e:
-        ui_log(f"❌ [Phase 1] Failed reading log file: {e}")
-        return
-
-    # Scrub out color ANSI markers ("?" boxes)
-    cleaned_content = ansi_cleaner_regex.sub("", raw_content)
-    cleaned_content = cleaned_content.replace("[entrypoint] ", "")
-
-    match_count = 0
-    temp_history_stack = []
-
-    for match in status_block_regex.finditer(cleaned_content):
-        raw_ts = match.group(1)
-        last_hr = float(match.group(4))
-        last_se = float(match.group(5))
-        
-        c_w = 0.0  
-        t_c = 0.0
-        
-        try:
-            from datetime import datetime
-            dt_parsed = datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
-            temp_history_stack.append([dt_parsed.timestamp(), last_se, c_w, last_hr, t_c])
-            match_count += 1
-        except Exception:
-            pass
-
-    dashboard_history = temp_history_stack[-10000:]
-    #ui_log(f"🎉 [Phase 1] Done! Parsed & added {match_count:,} historical frames to memory.")
+        ui_log(f"❌ [Phase 1] Failed reading {target_file}: {e}", "error")
+        dashboard_history = []
 
 def fetch_market_data(app=None):
     """Queries external public ledger and currency exchange endpoints with a 5-minute cache protection."""
@@ -322,28 +366,63 @@ def parse_hashrate_to_th(h_val):
     except Exception:
         return 0.0
 
+def load_miner_image_from_compose():
+    """Reads docker-compose.yml in this script's directory and extracts miner image/name/version."""
+    compose_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "docker-compose.yml")
+    if not os.path.exists(compose_path):
+        return "docker-compose.yml not found", "Unknown miner", "Unknown version"
+
+    try:
+        with open(compose_path, "r", encoding="utf-8") as compose_file:
+            compose_text = compose_file.read()
+
+        image_match = re.search(r"^\s*image:\s*([^\s#]+)", compose_text, re.MULTILINE)
+        if not image_match:
+            return "image not found in docker-compose.yml", "Unknown miner", "Unknown version"
+
+        image_value = image_match.group(1).strip().strip("\"").strip("'")
+        image_leaf = image_value.split("/")[-1]
+        if ":" in image_leaf:
+            name, version = image_leaf.rsplit(":", 1)
+        else:
+            name, version = image_leaf, "latest"
+
+        return image_value, name, version
+    except Exception:
+        return "docker-compose.yml read error", "Unknown miner", "Unknown version"
+
 def get_historical_metrics(lookback_hours):
     """Sifts historical timeline records to compute real realized gross margins and power expenses."""
     current_time = datetime.now()
     cutoff = (current_time - timedelta(hours=lookback_hours)).timestamp()
     valid_entries = [e for e in dashboard_history if e[0] >= cutoff]
     if not valid_entries or cached_wtm_data is None or cached_btc_usd is None: return 0.0, 0.0, 0.0
-    elapsed_m = (current_time - start_time).total_seconds() / 60.0 if start_time else 1.0
-    active_mining_hours = min(float(lookback_hours), elapsed_m / 60.0)
-    hist_avg_hr = sum(e[3] for e in valid_entries) / len(valid_entries)
+    oldest_ts = min(e[0] for e in valid_entries)
+    newest_ts = max(e[0] for e in valid_entries)
+    active_mining_hours = min(float(lookback_hours), max(0.0, (newest_ts - oldest_ts) / 3600.0))
+    valid_hashrates = [e[3] for e in valid_entries if len(e) > 3 and e[3] and e[3] > 0]
+    hist_avg_hr = sum(valid_hashrates) / len(valid_hashrates) if valid_hashrates else 0.0
     
     try:
-        wtm_daily_revenue_usd = float(cached_wtm_data.get('revenue', '$0.00').replace('$', '').strip())
-    except Exception: wtm_daily_revenue_usd = 0.0
+        wtm_daily_revenue_usd = float(str(cached_wtm_data.get('revenue', '$0.00')).replace('$', '').strip())
+    except Exception:
+        wtm_daily_revenue_usd = 0.0
+
+    # WhatToMine already presents values with an assumed 15% reduction.
+    # WTM_PROFIT_OFFSET_PCT=15 means use WTM as-presented; higher/lower values scale relative to that baseline.
     scaling_factor = (100.0 - WTM_PROFIT_OFFSET_PCT) / 85.0
     base_revenue = wtm_daily_revenue_usd * scaling_factor
     usd_per_th_day = base_revenue / 153.0
 
     hist_rev = hist_avg_hr * usd_per_th_day * (active_mining_hours / 24.0)
-    if not USE_TIME_OF_USE:
-        hist_cost = (sum(e[2] for e in valid_entries) / len(valid_entries) / 1000.0) * STATIC_KWH_RATE * active_mining_hours
+    valid_power_entries = [e for e in valid_entries if len(e) > 2 and e[2] and e[2] > 0]
+    if not valid_power_entries or active_mining_hours <= 0:
+        hist_cost = 0.0
+    elif not USE_TIME_OF_USE:
+        avg_watts = sum(e[2] for e in valid_power_entries) / len(valid_power_entries)
+        hist_cost = (avg_watts / 1000.0) * STATIC_KWH_RATE * active_mining_hours
     else:
-        avg_hourly_cost = sum((e[2] / 1000.0) * get_kwh_rate(datetime.fromtimestamp(e[0])) for e in valid_entries) / len(valid_entries)
+        avg_hourly_cost = sum((e[2] / 1000.0) * get_kwh_rate(datetime.fromtimestamp(e[0])) for e in valid_power_entries) / len(valid_power_entries)
         hist_cost = avg_hourly_cost * active_mining_hours
     return hist_rev, hist_cost, (hist_rev - hist_cost)
 
@@ -536,8 +615,8 @@ class AlphaMinerTUI(App):
     @work(thread=True)
     def run_monitoring_task(self) -> None:
         """Core Background Thread. Coordinates docker hooks, hardware polling, and matrix math."""
-        global total_shares, session_shares, total_errors, recent_errors_log, hashrates
-        global current_difficulty, last_attempts, last_hits, last_tmac, last_share_equiv_th, share_timestamps
+        global total_shares, session_shares, total_candidates, session_candidates, historical_lines_read, historical_submitted_shares, historical_candidate_shares, historical_shares_per_min, historical_records_loaded, total_errors, recent_errors_log, hashrates
+        global current_difficulty, difficulty_mode, session_difficulties, stratum_endpoint, miner_image, miner_name, miner_version, last_attempts, last_hits, last_tmac, last_share_equiv_th, share_timestamps
         global current_w, temp_c, seen_lines, start_time
         
         try:
@@ -557,17 +636,31 @@ class AlphaMinerTUI(App):
                 current_w = 165.0
                 temp_c = 66.0
 
-            if os.path.exists(HISTORY_FILE_NAME):
-                self.call_from_thread(self.log_msg, f"\nℹ️ Found local {HISTORY_FILE_NAME}. Loading parser indices...", "app")
-            else:
+            if USE_PERSISTENT_LOG_FILE and os.path.exists(HISTORY_FILE_NAME):
+                self.call_from_thread(self.log_msg, f"ℹ️ Found local {HISTORY_FILE_NAME}. Loading full persistent log file...", "app")
+                load_history_from_local_file(self)
+
+                hist_hashrates = [row[3] for row in dashboard_history if len(row) > 3 and row[3] and row[3] > 0]
+                hist_avg_hr_pre = sum(hist_hashrates) / len(hist_hashrates) if hist_hashrates else 0.0
+
+            elif USE_PERSISTENT_LOG_FILE:
                 self.call_from_thread(self.log_msg, f"\nℹ️ No local {HISTORY_FILE_NAME} found yet. Skipping parser.", "app")
 
-            self.call_from_thread(self.log_msg, f"\n🔄 Phase 1: Contacting Docker Engine and reading recent active container logs...", "app")
+            else:
+                self.call_from_thread(
+                    self.log_msg,
+                    "\nℹ️ Persistent log loading disabled by user config. Running Docker/session-only mode.",
+                    "app"
+                )
+
+            miner_image, miner_name, miner_version = load_miner_image_from_compose()
+
+            self.call_from_thread(self.log_msg, f"🔄 Contacting Docker Engine and reading recent active container logs...", "app")
 
             history_result = subprocess.run(["docker", "logs", container_name], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="ignore")
             if history_result.returncode == 0:
                 historical_lines = history_result.stdout.splitlines()
-                self.call_from_thread(self.log_msg, f"   Loaded {len(historical_lines):,} lines of container history. Parsing patterns...\n", "app")
+                # self.call_from_thread(self.log_msg, f"   Loaded {len(historical_lines):,} lines of container history. Parsing patterns...\n", "app")
                 
                 for line in historical_lines:
                     line = line.strip()
@@ -577,9 +670,20 @@ class AlphaMinerTUI(App):
                     parsed_ts = parse_timestamp(clean_line)
                     if start_time is None and parsed_ts: start_time = parsed_ts
 
+                    if "[entrypoint] static difficulty=" in clean_line.lower():
+                        difficulty_mode = "Static"
+
                     if "difficulty=" in clean_line:
                         diff_match = re.search(r"difficulty=([\d.]+)", clean_line)
-                        if diff_match: current_difficulty = diff_match.group(1)
+                        if diff_match:
+                            current_difficulty = diff_match.group(1)
+
+                    if "[entrypoint] starting" in clean_line.lower() and "against" in clean_line.lower():
+                        stratum_match = re.search(r"against\s+([^\s]+)", clean_line, re.IGNORECASE)
+                        if stratum_match: stratum_endpoint = stratum_match.group(1)
+
+                    if "component=share found_candidate" in clean_line:
+                        total_candidates += 1
 
                     if "component=share submitted" in clean_line:
                         total_shares += 1
@@ -619,7 +723,7 @@ class AlphaMinerTUI(App):
                 # -------------------------------------------------------------------------
                 # 📦 SUMMARY 1: LIVE DOCKER RUNTIME DATA
                 # -------------------------------------------------------------------------
-                self.call_from_thread(self.log_msg, "\n===========================================================================", "app")
+                self.call_from_thread(self.log_msg, "===========================================================================", "app")
                 self.call_from_thread(self.log_msg, f"📊 LIVE DOCKER LOGS SUMMARY (Container Start: {c_start})", "app")
                 self.call_from_thread(self.log_msg, f"  • Active Container Runtime : {runtime_mins:.1f} minutes", "app")
                 self.call_from_thread(self.log_msg, f"  • Current Session Shares   : {total_shares:,} ({shares_per_min:.2f} shares/min)", "app")
@@ -633,7 +737,7 @@ class AlphaMinerTUI(App):
                 
 
                 # Ensure the file exists before checking memory or printing summaries
-                if os.path.exists(HISTORY_FILE_NAME) and ('dashboard_history' in globals() or 'dashboard_history' in locals()):
+                if USE_PERSISTENT_LOG_FILE and os.path.exists(HISTORY_FILE_NAME) and historical_records_loaded > 0:
                     total_history_points = len(dashboard_history)
                     if total_history_points > 0:
                         # Extract the oldest and newest items in history file memory matrix
@@ -642,24 +746,27 @@ class AlphaMinerTUI(App):
                         
                         history_span_hours = (newest_ts - oldest_ts) / 3600.0
                         
-                        # 🟢 FIX: Hardware Hashrate is now located at row[2] instead of row[3]
-                        all_historical_hashrates = [row[2] for row in dashboard_history if row[2] > 0]
+                        # Hardware hashrate is stored at row[3]; row[2] is watts.
+                        all_historical_hashrates = [row[3] for row in dashboard_history if len(row) > 3 and row[3] and row[3] > 0]
                         historical_avg_hr = sum(all_historical_hashrates) / len(all_historical_hashrates) if all_historical_hashrates else 0.0
                         
                         self.call_from_thread(self.log_msg, f"📂 HISTORICAL LOG FILE SUMMARY ({HISTORY_FILE_NAME})", "app")
                         self.call_from_thread(self.log_msg, f"  • Log Storage Profile Range: {history_span_hours:.1f} Total Hours Compiled", "app")
                         self.call_from_thread(self.log_msg, f"  • Long-Term Historical Speed: {historical_avg_hr:.2f} TH/s Average", "app")
+                        self.call_from_thread(self.log_msg, f"  • Historical Shares Submitted: {historical_submitted_shares:,} ({historical_shares_per_min:.2f} shares/min)", "app")
+                        self.call_from_thread(self.log_msg, f"  • Historical Candidate Shares: {historical_candidate_shares:,}", "app")
+                        self.call_from_thread(self.log_msg, f"  • Historical Lines Read: {historical_lines_read:,}", "app")
                         self.call_from_thread(self.log_msg, f"  • Aggregated Database Records: {total_history_points:,} Metrics points mapped", "app")
                         
                         # Only print the closing box border line if the summary was printed
-                        self.call_from_thread(self.log_msg, "===========================================================================\n", "app")
+                        self.call_from_thread(self.log_msg, "===========================================================================", "app")
                     else:
                         # Optional: uncomment if you want a notification when the file exists but hasn't finished reading yet
                         # self.call_from_thread(self.log_msg, f"📂 HISTORICAL LOG FILE SUMMARY: [yellow]Empty or parsing data holds...[/yellow]", "app")
                         # self.call_from_thread(self.log_msg, "===========================================================================\n", "app")
                         pass
 
-            self.call_from_thread(self.log_msg, "\n🔄 Phase 2: Launching main execution matrix loops...\n", "app")
+            self.call_from_thread(self.log_msg, "🔄 Phase 2: Launching main execution matrix loops...\n", "app")
 
         except Exception as e:
             self.call_from_thread(self.log_msg, f"❌ Pre-load Exception: {e}", "error")
@@ -687,18 +794,44 @@ class AlphaMinerTUI(App):
 
                         line_ts = parse_timestamp(clean_line) or datetime.now()
 
+                        if "[entrypoint] static difficulty=" in clean_line.lower():
+                            difficulty_mode = "Static"
+
                         if "difficulty=" in clean_line:
                             diff_match = re.search(r"difficulty=([\d.]+)", clean_line)
-                            if diff_match: current_difficulty = diff_match.group(1)
+                            if diff_match:
+                                current_difficulty = diff_match.group(1)
+                                try:
+                                    session_difficulties.append(float(current_difficulty))
+                                except Exception:
+                                    pass
+
+                        if "[entrypoint] starting" in clean_line.lower() and "against" in clean_line.lower():
+                            stratum_match = re.search(r"against\s+([^\s]+)", clean_line, re.IGNORECASE)
+                            if stratum_match: stratum_endpoint = stratum_match.group(1)
+
+                        if "component=share found_candidate" in clean_line:
+                            total_candidates += 1
+                            session_candidates += 1
 
                         if "component=share submitted" in clean_line:
                             total_shares += 1
                             session_shares += 1
                             share_timestamps.append(line_ts)
-                            now_track = datetime.now()
                             
-                            session_elapsed_mins = (now_track - monitor_script_start_time).total_seconds() / 60.0
-                            session_shares_per_min = session_shares / max(1 / 60, session_elapsed_mins) if session_elapsed_mins > 0 else 0.0
+                            now_track = datetime.now()
+
+                            # Docker Session Pace = Docker preload shares + current live shares,
+                            # divided by elapsed time from the first Docker log timestamp.
+                            # This intentionally uses total_shares, not session_shares.
+                            docker_session_start = start_time or monitor_script_start_time
+                            docker_session_elapsed_mins = (now_track - docker_session_start).total_seconds() / 60.0
+
+                            session_shares_per_min = (
+                                total_shares / max(1 / 60, docker_session_elapsed_mins)
+                                if docker_session_elapsed_mins > 0
+                                else 0.0
+                            )
                             
                             share_timestamps = [ts for ts in share_timestamps if (now_track - ts).total_seconds() <= 60]
                             if len(share_timestamps) > 1:
@@ -707,7 +840,7 @@ class AlphaMinerTUI(App):
                             else:
                                 last_min_shares_per_min = float(len(share_timestamps))
                             
-                            share_msg = f"⏱️ [{line_ts.strftime('%H:%M:%S')}] 🟢 SHARE ACCEPTED! Total: {total_shares} | Last 1m Pace: {last_min_shares_per_min:.2f} shares/min | Session Pace: {session_shares_per_min:.2f} shares/min"
+                            share_msg = f"⏱️ [{line_ts.strftime('%H:%M:%S')}] 🟢 SHARE ACCEPTED! Total: {total_shares} | Last 1m Pace: {last_min_shares_per_min:.2f} shares/min | Docker Session Pace: {session_shares_per_min:.2f} shares/min"
                             self.call_from_thread(self.log_msg, share_msg, "share")
 
                         elif "component=miner status" in clean_line:
@@ -838,35 +971,83 @@ class AlphaMinerTUI(App):
                 rev_1h, cost_1h, prof_1h = get_historical_metrics(1)
                 rev_24h, cost_24h, prof_24h = get_historical_metrics(24)
                 
-                if dashboard_history:
-                    total_logs = len(dashboard_history)
-                    session_avg_pool = sum(e[1] for e in dashboard_history) / total_logs
-                    session_avg_w = sum(e[2] for e in dashboard_history) / total_logs
-                    session_avg_hr = sum(e[3] for e in dashboard_history) / total_logs
-                    session_avg_temp = sum(e[4] for e in dashboard_history) / total_logs
+                def avg_history_field(entries, index, fallback=0.0):
+                    vals = [e[index] for e in entries if len(e) > index and e[index] is not None]
+                    return (sum(vals) / len(vals)) if vals else fallback
+
+                file_log_consumed = historical_records_loaded > 0
+                session_history_entries = dashboard_history[historical_records_loaded:] if file_log_consumed else dashboard_history
+
+                if session_history_entries:
+                    session_avg_pool = avg_history_field(session_history_entries, 1, last_share_equiv_th)
+                    session_avg_w = avg_history_field(session_history_entries, 2, current_w)
+                    session_avg_hr = avg_history_field(session_history_entries, 3, current_hr)
+                    session_avg_temp = avg_history_field(session_history_entries, 4, temp_c)
                 else:
                     session_avg_pool, session_avg_w, session_avg_hr, session_avg_temp = last_share_equiv_th, current_w, current_hr, temp_c
 
+                total_logging_avg_pool = avg_history_field(dashboard_history, 1, last_share_equiv_th) if file_log_consumed else None
+                total_logging_avg_hr = avg_history_field(dashboard_history, 3, current_hr) if file_log_consumed else None
+
+                # Moving averages are still calculated above as avg_hr / avg_pool_equiv, but hidden for now.
+                # Re-add them to the UI lines later if you want the short-window smoothing back.
+                hardware_speed_line = (
+                    f"  ⚡ Hardware Speed : Current: [cyan]{current_hr:.2f} TH/s[/cyan] | "
+                    f"Session Avg: {session_avg_hr:.2f} TH/s"
+                )
+                pool_efficiency_line = (
+                    f"  🌍 Pool Efficiency: Current: [cyan]{last_share_equiv_th:.2f} TH/s[/cyan] | "
+                    f"Session Avg: {session_avg_pool:.2f} TH/s"
+                )
+                if file_log_consumed:
+                    hardware_speed_line += f" | Total Logging Avg: {total_logging_avg_hr:.2f} TH/s"
+                    pool_efficiency_line += f" | Total Logging Avg: {total_logging_avg_pool:.2f} TH/s"
+
                 elapsed_mins = (datetime.now() - start_time).total_seconds() / 60.0
-                calculated_stales = max(0, last_hits - total_shares)
-                stale_pct = (calculated_stales / last_hits * 100) if last_hits > 0 else 0.0
+                # work_hit_pct intentionally hidden from the card for now; kept here in case you want it back.
+                # work_hit_pct = (last_hits / last_attempts * 100.0) if last_attempts > 0 else 0.0
+                candidate_basis = total_candidates if total_candidates > 0 else last_hits
+                calculated_stales = max(0, candidate_basis - total_shares)
+                stale_pct = (calculated_stales / candidate_basis * 100.0) if candidate_basis > 0 else 0.0
+                submit_pct = (total_shares / candidate_basis * 100.0) if candidate_basis > 0 else 0.0
+
+                try:
+                    current_difficulty_display = f"{float(current_difficulty):,.0f}"
+                except Exception:
+                    current_difficulty_display = current_difficulty
+
+                difficulty_suffix = f"({difficulty_mode})"
+                difficulty_avg_text = ""
+                if difficulty_mode == "VarDiff":
+                    if session_difficulties:
+                        session_avg_diff = sum(session_difficulties) / len(session_difficulties)
+                    else:
+                        try:
+                            session_avg_diff = float(current_difficulty)
+                        except Exception:
+                            session_avg_diff = 0.0
+
+                    difficulty_avg_text = f" | Session Avg: {session_avg_diff:,.0f}"
+    
+                miner_line = f"  ⛏️ Stratum        : [white]{stratum_endpoint}[/white] | Miner: [white]{miner_name}[/white] | Version: [white]{miner_version}[/white]"
 
                 # ── CARD 1: DASHBOARD TELEMETRY ──
                 dash_text = (
                     f"📊 [bold #00E5FF]MINER TELEMETRY SYSTEM[/bold #00E5FF]  ⏱️ Total Uptime: [cyan]{int(elapsed_mins//60)}h {int(elapsed_mins%60)}m[/cyan] • "
                     f"Last Status At: [cyan]{last_stream_refresh_time}[/cyan]\n"
-                    f"  ⚒️ Network Difficulty: [white]{current_difficulty}[/white]\n"
-                    f"  ⚡ Hardware Speed : [spring_green3]{current_hr:.2f} TH/s[/spring_green3] (Moving Avg: {avg_hr:.2f} TH/s | Session Avg: {session_avg_hr:.2f} TH/s)\n"
-                    f"  🌍 Pool Efficiency: [turquoise2]{last_share_equiv_th:.2f} TH/s[/turquoise2] (Moving Avg: {avg_pool_equiv:.2f} TH/s | Session Avg: {session_avg_pool:.2f} TH/s)\n"
-                    f"  🎲 Work Ratios    : Attempts: {last_attempts} | Total Hits: {last_hits}\n"
-                    f"  ⏳ Stale/Lag Rate : [bright_red]{calculated_stales} stale shares ({stale_pct:.2f}%)[/bright_red]\n"
+                    f"  ⚒️ Network Difficulty: [white]{current_difficulty_display}[/white] {difficulty_suffix}{difficulty_avg_text}\n"
+                    f"{hardware_speed_line}\n"
+                    f"{pool_efficiency_line}\n"
+                    # f"  🎲 Work Ratios    : Attempts: {last_attempts:,} | Miner Hits: {last_hits:,}\n"
+                    f"{miner_line}\n"
+                    f"  ⏳ Stale/Lag Rate : [bright_red]{calculated_stales:,} stale/unsent shares ({stale_pct:.2f}%)[/bright_red] | Submitted: {total_shares:,}/{candidate_basis:,} ({submit_pct:.2f}%)\n"
                 )
                 if last_api_fetch_time:
                     seconds_since_fetch = (datetime.now() - last_api_fetch_time).total_seconds()
                     time_remaining = max(0, int(300 - seconds_since_fetch))
-                    dash_text += f"  🌐 Financial Data  : Next API pull cycle in {time_remaining}s"
+                    dash_text += f"  🌐 Financial Data : Next API pull cycle in {time_remaining}s"
                 else:
-                    dash_text += f"  🌐 Financial Data  : Next API pull cycle imminent"
+                    dash_text += f"  🌐 Financial Data : Next API pull cycle imminent"
                 self.call_from_thread(self.query_one("#miner_dashboard", Static).update, dash_text)
 
                 # ── CARD 2: ALPHAPOOL GLOBAL METRICS ──
@@ -874,7 +1055,7 @@ class AlphaMinerTUI(App):
                 if pool_data:
                     g_text += (
                         f"  • Network Total Speed : [white]{format_hashrate(network_hash_th)}[/white]\n"
-                        f"  • AlphaPool Speed     : [cyan]{format_hashrate(pool_hash_th)}[/cyan] ({pool_percentage:.2f}% of Global Network)\n"
+                        f"  • AlphaPool Speed     : [white]{format_hashrate(pool_hash_th)}[/white] ({pool_percentage:.2f}% of Global Network)\n"
                         f"  • Participation       : [white]{active_miners:,}[/white] Miners online  |  [white]{active_workers:,}[/white] Workers active\n"
                         f"  • Block Production    : [spring_green3]{blocks_24h}[/spring_green3] Blocks discovered in past 24h"
                     )
@@ -893,7 +1074,7 @@ class AlphaMinerTUI(App):
                             formatted_time = "Unknown"
                             
                         block_amount = latest_block.get('amount', 0.0)
-                        g_text += f"\n  • Last Block Found    : [yellow]{formatted_time}[/yellow]  |  Amount: [cyan]{block_amount} {coin_tag}[/cyan]"
+                        g_text += f"\n  • Last Block Found    : [white]{formatted_time}[/white]  |  Amount: [cyan]{block_amount} {coin_tag}[/cyan]"
                 else:
                     g_text += f"  • status: [grey50]Syncing node network data feeds...[/grey50]" 
                 self.call_from_thread(self.query_one("#alphapool_global", Static).update, g_text)
