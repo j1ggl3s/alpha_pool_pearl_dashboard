@@ -85,6 +85,12 @@ total_errors = 0
 recent_errors_log = []  
 hashrates = []
 current_difficulty = "[red]\\[FETCHING...\\][/red]"
+difficulty_mode = "VarDiff"
+session_difficulties = []
+stratum_endpoint = "Detecting stratum..."
+miner_image = "Detecting miner image..."
+miner_name = "Detecting miner..."
+miner_version = "Detecting version..."
 last_attempts = 0
 last_hits = 0
 last_tmac = 0.0
@@ -332,6 +338,30 @@ def parse_timestamp(line):
         ms = int(local_match.group(3)[:3]) if local_match.group(3) else 0
         return datetime(year, month, day, hour, minute, second, ms * 1000)
     return None
+    
+def convert_log_timestamp_to_local(line):
+    """Converts a leading UTC/Z log timestamp into local system time for display."""
+    ts_match = re.match(
+        r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3,6})?Z)",
+        line
+    )
+    if not ts_match:
+        return line
+    raw_ts = ts_match.group(1)
+    try:
+        # Convert trailing Z into UTC timezone-aware datetime
+        utc_dt = datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
+
+        # Convert to system local time
+        local_dt = utc_dt.astimezone()
+
+        # Format however you want it displayed
+        local_ts = local_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+        return line.replace(raw_ts, local_ts, 1)
+
+    except Exception:
+        return line
 
 def format_hashrate(th_val):
     """Dynamically scales and labels rough TH values into clean, human-readable EH/PH units."""
@@ -359,6 +389,35 @@ def parse_hashrate_to_th(h_val):
         return val
     except Exception:
         return 0.0
+
+def load_miner_name_from_compose():
+    """Reads docker-compose.yml and extracts the full miner image name without the version tag."""
+    compose_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "docker-compose.yml")
+
+    if not os.path.exists(compose_path):
+        return "Unknown miner"
+
+    try:
+        with open(compose_path, "r", encoding="utf-8") as compose_file:
+            compose_text = compose_file.read()
+
+        image_match = re.search(r"^\s*image:\s*([^\s#]+)", compose_text, re.MULTILINE)
+        if not image_match:
+            return "Unknown miner"
+
+        image_value = image_match.group(1).strip().strip('"').strip("'")
+
+        # Keep the full repository/name, only remove the tag/version.
+        # Example: alphaminetech/pearl-miner:1.7.7 -> alphaminetech/pearl-miner
+        if ":" in image_value:
+            miner_name = image_value.rsplit(":", 1)[0]
+        else:
+            miner_name = image_value
+
+        return miner_name
+
+    except Exception:
+        return "Unknown miner"
 
 def get_historical_metrics(lookback_hours):
     """Sifts historical timeline records to compute real realized gross margins and power expenses."""
@@ -585,7 +644,7 @@ class AlphaMinerTUI(App):
     def run_monitoring_task(self) -> None:
         """Core Background Thread. Coordinates docker hooks, hardware polling, and matrix math."""
         global total_shares, session_shares, total_candidates, session_candidates, historical_lines_read, historical_submitted_shares, historical_candidate_shares, historical_shares_per_min, historical_records_loaded, total_errors, recent_errors_log, hashrates
-        global current_difficulty, last_attempts, last_hits, last_tmac, last_share_equiv_th, share_timestamps
+        global current_difficulty, difficulty_mode, session_difficulties, stratum_endpoint, miner_name, miner_version, last_attempts, last_hits, last_tmac, last_share_equiv_th, share_timestamps
         global current_w, temp_c, seen_lines, start_time
         
         try:
@@ -622,6 +681,8 @@ class AlphaMinerTUI(App):
                     "app"
                 )
 
+            miner_name = load_miner_name_from_compose()
+
             self.call_from_thread(self.log_msg, f"🔄 Contacting Docker Engine and reading recent active container logs...", "app")
 
             history_result = subprocess.run(["docker", "logs", container_name], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="ignore")
@@ -637,9 +698,17 @@ class AlphaMinerTUI(App):
                     parsed_ts = parse_timestamp(clean_line)
                     if start_time is None and parsed_ts: start_time = parsed_ts
 
+                    if "[entrypoint] static difficulty=" in clean_line.lower():
+                        difficulty_mode = "Static"
+
                     if "difficulty=" in clean_line:
                         diff_match = re.search(r"difficulty=([\d.]+)", clean_line)
-                        if diff_match: current_difficulty = diff_match.group(1)
+                        if diff_match:
+                            current_difficulty = diff_match.group(1)
+
+                    if "[entrypoint] starting" in clean_line.lower() and "against" in clean_line.lower():
+                        stratum_match = re.search(r"against\s+([^\s]+)", clean_line, re.IGNORECASE)
+                        if stratum_match: stratum_endpoint = stratum_match.group(1)
 
                     if "component=share found_candidate" in clean_line:
                         total_candidates += 1
@@ -666,9 +735,12 @@ class AlphaMinerTUI(App):
 
                     elif "level=ERROR" in clean_line or "level=WARN" in clean_line or "failed" in clean_line.lower():
                         total_errors += 1
-                        err_ts = parsed_ts or datetime.now()
-                        err_msg = f"❌ {clean_line}"
-                        recent_errors_log.append(f"[{err_ts.strftime('%m-%d %H:%M:%S')}] {clean_line}")
+
+                        local_error_line = convert_log_timestamp_to_local(clean_line)
+                        err_ts = parse_timestamp(local_error_line) or parsed_ts or datetime.now()
+
+                        err_msg = f"⚠️ {local_error_line}\n"
+                        recent_errors_log.append(f"[{err_ts.strftime('%m-%d %H:%M:%S')}] {local_error_line}")
                         self.call_from_thread(self.log_msg, err_msg, "error")
 
                 avg_hr = sum(hashrates) / len(hashrates) if hashrates else 0.0
@@ -752,10 +824,26 @@ class AlphaMinerTUI(App):
                         if len(seen_lines) > 3000: seen_lines.pop(0)
 
                         line_ts = parse_timestamp(clean_line) or datetime.now()
+                        
+                        ver_match = re.search(r"\bver=([^\s]+)", clean_line)
+                        if ver_match:
+                            miner_version = ver_match.group(1)
+
+                        if "[entrypoint] static difficulty=" in clean_line.lower():
+                            difficulty_mode = "Static"
 
                         if "difficulty=" in clean_line:
                             diff_match = re.search(r"difficulty=([\d.]+)", clean_line)
-                            if diff_match: current_difficulty = diff_match.group(1)
+                            if diff_match:
+                                current_difficulty = diff_match.group(1)
+                                try:
+                                    session_difficulties.append(float(current_difficulty))
+                                except Exception:
+                                    pass
+
+                        if "[entrypoint] starting" in clean_line.lower() and "against" in clean_line.lower():
+                            stratum_match = re.search(r"against\s+([^\s]+)", clean_line, re.IGNORECASE)
+                            if stratum_match: stratum_endpoint = stratum_match.group(1)
 
                         if "component=share found_candidate" in clean_line:
                             total_candidates += 1
@@ -813,8 +901,12 @@ class AlphaMinerTUI(App):
 
                         elif "level=ERROR" in clean_line or "level=WARN" in clean_line or "failed" in clean_line.lower():
                             total_errors += 1
-                            err_msg = f"⚠️ ALERT: {clean_line}"
-                            recent_errors_log.append(f"[{line_ts.strftime('%m-%d %H:%M:%S')}] {clean_line}")
+
+                            local_error_line = convert_log_timestamp_to_local(clean_line)
+                            local_line_ts = parse_timestamp(local_error_line) or line_ts or datetime.now()
+
+                            err_msg = f"⚠️ ALERT: {local_error_line}\n"
+                            recent_errors_log.append(f"[{local_line_ts.strftime('%m-%d %H:%M:%S')}] {local_error_line}")
                             self.call_from_thread(self.log_msg, err_msg, "error")
 
                 error_status = "✅ 0 Concerns (Operational Stability Nominal)" if total_errors == 0 else f"🚨 {total_errors} CRITICAL ISSUES DETECTED"
@@ -958,22 +1050,43 @@ class AlphaMinerTUI(App):
                 stale_pct = (calculated_stales / candidate_basis * 100.0) if candidate_basis > 0 else 0.0
                 submit_pct = (total_shares / candidate_basis * 100.0) if candidate_basis > 0 else 0.0
 
+                try:
+                    current_difficulty_display = f"{float(current_difficulty):,.0f}"
+                except Exception:
+                    current_difficulty_display = current_difficulty
+
+                difficulty_suffix = f"({difficulty_mode})"
+                difficulty_avg_text = ""
+                if difficulty_mode == "VarDiff":
+                    if session_difficulties:
+                        session_avg_diff = sum(session_difficulties) / len(session_difficulties)
+                    else:
+                        try:
+                            session_avg_diff = float(current_difficulty)
+                        except Exception:
+                            session_avg_diff = 0.0
+
+                    difficulty_avg_text = f" | Session Avg: {session_avg_diff:,.0f}"
+    
+                miner_line = f"  ⛏️ Stratum        : [white]{stratum_endpoint}[/white] | Miner: [white]{miner_name}[/white] | Version: [white]{miner_version}[/white]"
+
                 # ── CARD 1: DASHBOARD TELEMETRY ──
                 dash_text = (
                     f"📊 [bold #00E5FF]MINER TELEMETRY SYSTEM[/bold #00E5FF]  ⏱️ Total Uptime: [cyan]{int(elapsed_mins//60)}h {int(elapsed_mins%60)}m[/cyan] • "
                     f"Last Status At: [cyan]{last_stream_refresh_time}[/cyan]\n"
-                    f"  ⚒️ Network Difficulty: [white]{current_difficulty}[/white]\n"
+                    f"  ⚒️ Network Difficulty: [white]{current_difficulty_display}[/white] {difficulty_suffix}{difficulty_avg_text}\n"
                     f"{hardware_speed_line}\n"
                     f"{pool_efficiency_line}\n"
-                    f"  🎲 Work Ratios    : Attempts: {last_attempts:,} | Miner Hits: {last_hits:,}\n"
+                    # f"  🎲 Work Ratios    : Attempts: {last_attempts:,} | Miner Hits: {last_hits:,}\n"
+                    f"{miner_line}\n"
                     f"  ⏳ Stale/Lag Rate : [bright_red]{calculated_stales:,} stale/unsent shares ({stale_pct:.2f}%)[/bright_red] | Submitted: {total_shares:,}/{candidate_basis:,} ({submit_pct:.2f}%)\n"
                 )
                 if last_api_fetch_time:
                     seconds_since_fetch = (datetime.now() - last_api_fetch_time).total_seconds()
                     time_remaining = max(0, int(300 - seconds_since_fetch))
-                    dash_text += f"  🌐 Financial Data  : Next API pull cycle in {time_remaining}s"
+                    dash_text += f"  🌐 Financial Data : Next API pull cycle in {time_remaining}s"
                 else:
-                    dash_text += f"  🌐 Financial Data  : Next API pull cycle imminent"
+                    dash_text += f"  🌐 Financial Data : Next API pull cycle imminent"
                 self.call_from_thread(self.query_one("#miner_dashboard", Static).update, dash_text)
 
                 # ── CARD 2: ALPHAPOOL GLOBAL METRICS ──
