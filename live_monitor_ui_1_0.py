@@ -52,6 +52,18 @@ USE_PERSISTENT_LOG_FILE = False
 # Public key address used to pull pool-side worker shares, balances, and payment metrics.
 WALLET_ADDRESS = ""
 
+# REALTIME MINER API ENDPOINT:
+# Enhancement: if this local miner API is reachable, the dashboard uses it for live miner
+# telemetry instead of polling Docker logs during the realtime loop. Docker history/preload
+# remains available as a fallback and for existing historical behavior.
+REALTIME_MINER_API_URL = "http://127.0.0.1:21550"
+REALTIME_MINER_API_TIMEOUT = 1.5
+
+# MINER/WALLET API REFRESH CADENCE:
+# Enhancement: when realtime API polling is active, refresh the miner/wallet API once per minute.
+# The realtime miner API itself still polls every main loop pass; this only throttles wallet pulls.
+REALTIME_WALLET_API_REFRESH_SECONDS = 60
+
 # POWER EXPENSE ENGINE SWITCH:
 # Set to True to use dynamic, tier-based power tracking using seasonal/hourly schedules.
 # Set to False to bypass the schedules and use the flat STATIC_KWH_RATE exclusively.
@@ -84,6 +96,13 @@ historical_records_loaded = 0
 total_errors = 0
 recent_errors_log = []  
 hashrates = []
+current_hr = 0.0
+avg_hr = 0.0
+avg_pool_equiv = 0.0
+# Enhancement: realtime API session history compiles reported hashrates internally,
+# instead of waiting for delayed 1hr/24hr pool-reported averages.
+api_hardware_session_hashrates = []
+api_pool_session_hashrates = []
 current_difficulty = "[red]\\[FETCHING...\\][/red]"
 difficulty_mode = "VarDiff"
 session_difficulties = []
@@ -97,6 +116,10 @@ last_tmac = 0.0
 last_share_equiv_th = 0.0
 share_timestamps = []
 last_stream_refresh_time = "Pending initial status..."  # Tracks true telemetry events only
+
+# Enhancement: tracks whether the local realtime miner API is available for live telemetry.
+use_realtime_miner_api = False
+last_realtime_api_data = None
 
 # Log-filtering pipeline
 raw_log_history = []     # Rolling memory cache of all generated log tuples: (category, text)
@@ -130,6 +153,7 @@ cached_btc_usd = None
 cached_historical_btc = {"1d": None, "3d": None, "7d": None} 
 cached_pool_data = None
 cached_wallet_data = None
+last_wallet_api_fetch_time = None
 
 
 def get_kwh_rate(dt):
@@ -245,7 +269,7 @@ def load_history_from_local_file(app=None):
 
 def fetch_market_data(app=None):
     """Queries external public ledger and currency exchange endpoints with a 5-minute cache protection."""
-    global last_api_fetch_time, cached_wtm_data, cached_btc_usd, cached_historical_btc, cached_pool_data, cached_wallet_data
+    global last_api_fetch_time, cached_wtm_data, cached_btc_usd, cached_historical_btc, cached_pool_data, cached_wallet_data, last_wallet_api_fetch_time
     now = datetime.now()
     if last_api_fetch_time and (now - last_api_fetch_time).total_seconds() < 300:
         return cached_wtm_data, cached_btc_usd, cached_historical_btc, cached_pool_data, cached_wallet_data
@@ -311,6 +335,8 @@ def fetch_market_data(app=None):
             req6 = urllib.request.Request(f"https://pearl.alphapool.tech/api/miner/{WALLET_ADDRESS}", headers={'User-Agent': 'Mozilla/5.0'})
             with urllib.request.urlopen(req6, timeout=4) as resp6:
                 cached_wallet_data = json.loads(resp6.read().decode())
+                # Enhancement: track wallet fetch time so realtime API mode can refresh this endpoint once per minute.
+                last_wallet_api_fetch_time = now
             if app: app.call_from_thread(app.log_msg, "   • AlphaPool (Wallet Ledger)    : 🟢 OK", "app")
         except Exception:
             if app: app.call_from_thread(app.log_msg, "   • AlphaPool (Wallet Ledger)    : ❌ FAIL", "app")
@@ -390,6 +416,109 @@ def parse_hashrate_to_th(h_val):
     except Exception:
         return 0.0
 
+# Enhancement: local realtime miner API helpers. These are intentionally small and
+# defensive so Docker-log parsing remains the safe fallback if the API is offline or
+# returns an unexpected shape.
+def hashrate_raw_to_th(raw_hashrate):
+    """Converts raw H/s-style API hashrate values into the dashboard's TH/s baseline."""
+    try:
+        return float(raw_hashrate or 0.0) / 1e12
+    except Exception:
+        return 0.0
+
+def average_reported_hashrates(hashrate_values):
+    """Returns the internal session average from every reported API hashrate sample."""
+    valid_values = [float(v) for v in hashrate_values if v is not None]
+    return sum(valid_values) / len(valid_values) if valid_values else 0.0
+
+def fetch_realtime_miner_api():
+    """Quick local API availability/data check for http://127.0.0.1:21550."""
+    try:
+        req = urllib.request.Request(REALTIME_MINER_API_URL, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=REALTIME_MINER_API_TIMEOUT) as resp:
+            if getattr(resp, "status", 200) != 200:
+                return None
+            return json.loads(resp.read().decode())
+    except Exception:
+        return None
+
+def fetch_realtime_wallet_data(app=None):
+    """Refreshes the miner/wallet API at most once per minute while realtime API polling is active."""
+    global cached_wallet_data, last_wallet_api_fetch_time
+
+    if not WALLET_ADDRESS:
+        return cached_wallet_data, False
+
+    now = datetime.now()
+    if last_wallet_api_fetch_time and (now - last_wallet_api_fetch_time).total_seconds() < REALTIME_WALLET_API_REFRESH_SECONDS:
+        return cached_wallet_data, False
+
+    try:
+        req = urllib.request.Request(f"https://pearl.alphapool.tech/api/miner/{WALLET_ADDRESS}", headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=4) as resp:
+            cached_wallet_data = json.loads(resp.read().decode())
+        last_wallet_api_fetch_time = now
+        if app: app.call_from_thread(app.log_msg, "   • AlphaPool (Wallet Ledger)    : 🟢 OK (Realtime 1m refresh)", "app")
+        return cached_wallet_data, True
+    except Exception:
+        if app: app.call_from_thread(app.log_msg, "   • AlphaPool (Wallet Ledger)    : ❌ FAIL (Realtime 1m refresh)", "app")
+        return cached_wallet_data, False
+
+def get_realtime_algorithm(api_payload):
+    """Returns the first algorithm block from the realtime API, or an empty dict if missing."""
+    try:
+        algorithms = api_payload.get("algorithms", []) if isinstance(api_payload, dict) else []
+        return algorithms[0] if algorithms else {}
+    except Exception:
+        return {}
+
+def realtime_api_uptime_minutes(api_payload, pool_payload=None):
+    """Converts realtime API uptime from seconds into dashboard minutes."""
+    try:
+        pool_payload = pool_payload or get_realtime_algorithm(api_payload).get("pool", {})
+        uptime_seconds = float(pool_payload.get("uptime", api_payload.get("mining_time", 0.0)) or 0.0)
+        return uptime_seconds / 60.0
+    except Exception:
+        return 0.0
+
+def find_first_key_recursive(payload, wanted_key):
+    """Recursively finds the first matching key in nested dict/list API payloads."""
+    if isinstance(payload, dict):
+        if wanted_key in payload:
+            return payload.get(wanted_key)
+        for nested_value in payload.values():
+            found_value = find_first_key_recursive(nested_value, wanted_key)
+            if found_value is not None:
+                return found_value
+    elif isinstance(payload, list):
+        for nested_item in payload:
+            found_value = find_first_key_recursive(nested_item, wanted_key)
+            if found_value is not None:
+                return found_value
+    return None
+
+def get_wallet_hashrate_th(wallet_payload, preferred_keys):
+    """Pulls AlphaPool miner/wallet hashrate fields and normalizes them to TH/s."""
+    if not isinstance(wallet_payload, dict):
+        return 0.0
+
+    # Enhancement: search the full miner/wallet API payload recursively so
+    # Pool Efficiency Current can equal hashrate_live no matter where the API nests it.
+    for key in preferred_keys:
+        raw_value = find_first_key_recursive(wallet_payload, key)
+        if raw_value is not None:
+            return parse_hashrate_to_th(raw_value)
+
+    return 0.0
+
+def get_wallet_difficulty(wallet_payload):
+    """Pulls static miner/wallet difficulty from common wallet API shapes."""
+    if not isinstance(wallet_payload, dict):
+        return None
+
+    # Enhancement: search recursively because wallet/miner APIs may nest difficulty differently.
+    return find_first_key_recursive(wallet_payload, "difficulty")
+
 def load_miner_name_from_compose():
     """Reads docker-compose.yml and extracts the full miner image name without the version tag."""
     compose_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "docker-compose.yml")
@@ -428,7 +557,15 @@ def get_historical_metrics(lookback_hours):
     oldest_ts = min(e[0] for e in valid_entries)
     newest_ts = max(e[0] for e in valid_entries)
     active_mining_hours = min(float(lookback_hours), max(0.0, (newest_ts - oldest_ts) / 3600.0))
-    valid_hashrates = [e[3] for e in valid_entries if len(e) > 3 and e[3] and e[3] > 0]
+    # Enhancement: realized gross should use pool/API hashrate when available (row[1]),
+    # falling back to hardware hashrate (row[3]) for older Docker-only history rows.
+    valid_hashrates = []
+    for e in valid_entries:
+        pool_hashrate = e[1] if len(e) > 1 and e[1] and e[1] > 0 else 0.0
+        hardware_hashrate = e[3] if len(e) > 3 and e[3] and e[3] > 0 else 0.0
+        selected_hashrate = pool_hashrate if pool_hashrate > 0 else hardware_hashrate
+        if selected_hashrate > 0:
+            valid_hashrates.append(selected_hashrate)
     hist_avg_hr = sum(valid_hashrates) / len(valid_hashrates) if valid_hashrates else 0.0
     
     try:
@@ -644,8 +781,11 @@ class AlphaMinerTUI(App):
     def run_monitoring_task(self) -> None:
         """Core Background Thread. Coordinates docker hooks, hardware polling, and matrix math."""
         global total_shares, session_shares, total_candidates, session_candidates, historical_lines_read, historical_submitted_shares, historical_candidate_shares, historical_shares_per_min, historical_records_loaded, total_errors, recent_errors_log, hashrates
-        global current_difficulty, difficulty_mode, session_difficulties, stratum_endpoint, miner_name, miner_version, last_attempts, last_hits, last_tmac, last_share_equiv_th, share_timestamps
+        global current_difficulty, difficulty_mode, session_difficulties, stratum_endpoint, miner_name, miner_version, last_attempts, last_hits, last_tmac, last_share_equiv_th, share_timestamps, last_stream_refresh_time
         global current_w, temp_c, seen_lines, start_time
+        global current_hr, avg_hr, avg_pool_equiv
+        global use_realtime_miner_api, last_realtime_api_data
+        global api_hardware_session_hashrates, api_pool_session_hashrates
         
         try:
             time.sleep(0.5)
@@ -683,7 +823,15 @@ class AlphaMinerTUI(App):
 
             miner_name = load_miner_name_from_compose()
 
-            self.call_from_thread(self.log_msg, f"🔄 Contacting Docker Engine and reading recent active container logs...", "app")
+            # Enhancement: quick startup check for the local realtime miner API.
+            # The realtime loop below still checks every cycle, so the API can come online later.
+            last_realtime_api_data = fetch_realtime_miner_api()
+            use_realtime_miner_api = last_realtime_api_data is not None
+            if use_realtime_miner_api:
+                self.call_from_thread(self.log_msg, f"🔌 Realtime Miner API detected at {REALTIME_MINER_API_URL}. Live telemetry will use API data.", "app")
+            else:
+                self.call_from_thread(self.log_msg, f"🔌 Realtime Miner API unavailable at {REALTIME_MINER_API_URL}. Falling back to Docker logs.", "app")
+                self.call_from_thread(self.log_msg, f"🔄 Contacting Docker Engine and reading recent active container logs...", "app")
 
             history_result = subprocess.run(["docker", "logs", container_name], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="ignore")
             if history_result.returncode == 0:
@@ -811,8 +959,48 @@ class AlphaMinerTUI(App):
                 if not self.is_running:
                     break
                     
-                result = subprocess.run(["docker", "logs", "--tail", "200", container_name], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="ignore")
-                if result.returncode == 0:
+                # Enhancement: query the local realtime API every loop pass (about once per second,
+                # controlled by the existing time.sleep(1) at the bottom of this loop). This means
+                # the API can come online after startup and immediately take over from Docker logs.
+                result = None
+                api_live = fetch_realtime_miner_api()
+                if api_live is not None:
+                    use_realtime_miner_api = True
+                    last_realtime_api_data = api_live
+                    algo_live = get_realtime_algorithm(api_live)
+                    pool_live = algo_live.get("pool", {}) if isinstance(algo_live, dict) else {}
+                    shares_live = algo_live.get("shares", {}) if isinstance(algo_live, dict) else {}
+                    hashrate_live_block = algo_live.get("hashrate", {}) if isinstance(algo_live, dict) else {}
+
+                    miner_name = str(api_live.get("rig_name", miner_name))
+                    miner_version = str(api_live.get("miner_version", miner_version))
+                    stratum_endpoint = str(pool_live.get("pool", stratum_endpoint))
+                    # Enhancement: realtime API reports a static miner difficulty.
+                    current_difficulty = str(pool_live.get("difficulty", current_difficulty))
+                    difficulty_mode = "Static"
+                    last_stream_refresh_time = "Realtime API"
+
+                    total_shares = int(shares_live.get("accepted", total_shares) or 0)
+                    total_candidates = int(shares_live.get("total", total_candidates) or 0)
+                    last_hits = total_candidates
+                    last_attempts = total_candidates
+                    current_hr = hashrate_raw_to_th(hashrate_live_block.get("1min", 0.0))
+
+                    # Enhancement: compile every reported hardware hashrate sample internally for session average.
+                    # This avoids waiting for delayed 1hr/6hr/12hr miner-reported averages.
+                    if "1min" in hashrate_live_block:
+                        api_hardware_session_hashrates.append(current_hr)
+                    avg_hr = average_reported_hashrates(api_hardware_session_hashrates) or current_hr
+
+                    # Enhancement: append API telemetry into the existing history matrix without changing the UI layout.
+                    dashboard_history.append([datetime.now().timestamp(), last_share_equiv_th, current_w, current_hr, temp_c])
+
+                else:
+                    if use_realtime_miner_api:
+                        self.call_from_thread(self.log_msg, "⚠️ Realtime Miner API went offline. Falling back to Docker logs.", "error")
+                    use_realtime_miner_api = False
+                    result = subprocess.run(["docker", "logs", "--tail", "200", container_name], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="ignore")
+                if result is not None and result.returncode == 0:
                     lines = result.stdout.splitlines()
                     for line in lines:
                         line = line.strip()
@@ -886,7 +1074,6 @@ class AlphaMinerTUI(App):
                             share_equiv_match = re.search(r"share_equiv_th_s=([\d.]+)", clean_line)
                             share_equiv_tmac_match = re.search(r"share_equiv_tmac_s=([\d.]+)", clean_line)
                             
-                            global last_stream_refresh_time
                             last_stream_refresh_time = datetime.now().strftime("%m-%d %H:%M:%S")
                             
                             if attempts_match: last_attempts = int(attempts_match.group(1))
@@ -936,13 +1123,19 @@ class AlphaMinerTUI(App):
                 # Sync market logs & matrices
                 current_time = datetime.now()
                 api_data, btc_price_usd, historical_btc_map, pool_data, wallet_data = fetch_market_data(self)
+                wallet_data_refreshed_this_loop = False
+                if use_realtime_miner_api:
+                    # Enhancement: only in realtime API mode, pull miner/wallet API once per minute.
+                    wallet_data, wallet_data_refreshed_this_loop = fetch_realtime_wallet_data(self)
                 usd_per_th_day, coin_tag, coin_btc_value, coin_price_usd = 0.0, "PRL", 0.0, 0.0
                 coin_btc_24h = coin_btc_3d = coin_btc_7d = 0.0
                 coin_usd_24h = coin_usd_3d = coin_usd_7d = 0.0
                 
-                btc_price_24h = historical_btc_map["1d"]
-                btc_price_3d = historical_btc_map["3d"]
-                btc_price_7d = historical_btc_map["7d"]
+                # Enhancement: keep UI cells populated even if a market API response is missing one cycle.
+                historical_btc_map = historical_btc_map or {"1d": None, "3d": None, "7d": None}
+                btc_price_24h = historical_btc_map.get("1d")
+                btc_price_3d = historical_btc_map.get("3d")
+                btc_price_7d = historical_btc_map.get("7d")
                 
                 if api_data:
                     coin_tag = api_data.get('tag', 'PRL')
@@ -995,6 +1188,23 @@ class AlphaMinerTUI(App):
                         total_paid_usd = total_paid_prl * coin_price_usd
                     except Exception: pass
 
+                # Enhancement: use miner/wallet API hashrate_live before revenue math runs.
+                # Previously Pool Efficiency Current was updated later in the render section, so gross
+                # forecast numbers could still be calculated from a stale/zero avg_pool_equiv value.
+                if use_realtime_miner_api and isinstance(wallet_data, dict):
+                    live_pool_hashrate_th_for_revenue = get_wallet_hashrate_th(wallet_data, ("hashrate_live",))
+                    last_share_equiv_th = live_pool_hashrate_th_for_revenue
+
+                    # Enhancement: compile each fresh once-per-minute wallet API hashrate_live report internally.
+                    # This avoids waiting for delayed 1hr/24hr pool-reported averages while avoiding duplicate cached samples.
+                    if wallet_data_refreshed_this_loop and find_first_key_recursive(wallet_data, "hashrate_live") is not None:
+                        api_pool_session_hashrates.append(live_pool_hashrate_th_for_revenue)
+
+                    avg_pool_equiv = live_pool_hashrate_th_for_revenue
+                    if dashboard_history:
+                        # Keep the latest history row aligned with the API pool hashrate for realized gross calculations.
+                        dashboard_history[-1][1] = live_pool_hashrate_th_for_revenue
+
                 if usd_per_th_day > 0 and btc_price_usd is not None:
                     rev_day = avg_pool_equiv * usd_per_th_day
                     rev_hour, rev_week, rev_month = rev_day / 24.0, rev_day * 7.0, rev_day * 30.416
@@ -1030,6 +1240,43 @@ class AlphaMinerTUI(App):
 
                 # Moving averages are still calculated above as avg_hr / avg_pool_equiv, but hidden for now.
                 # Re-add them to the UI lines later if you want the short-window smoothing back.
+                elapsed_mins = (datetime.now() - start_time).total_seconds() / 60.0
+
+                # Enhancement: when the realtime API is active, override only the live data values
+                # feeding the existing view; the card layout/text structure is intentionally preserved.
+                api_rejected_shares = None
+                if use_realtime_miner_api and isinstance(last_realtime_api_data, dict):
+                    api_algo_display = get_realtime_algorithm(last_realtime_api_data)
+                    api_pool_display = api_algo_display.get("pool", {}) if isinstance(api_algo_display, dict) else {}
+                    api_shares_display = api_algo_display.get("shares", {}) if isinstance(api_algo_display, dict) else {}
+                    api_hashrate_display = api_algo_display.get("hashrate", {}) if isinstance(api_algo_display, dict) else {}
+
+                    # Enhancement: realtime API uptime is reported in seconds, so convert to dashboard minutes.
+                    elapsed_mins = realtime_api_uptime_minutes(last_realtime_api_data, api_pool_display) or elapsed_mins
+                    current_hr = hashrate_raw_to_th(api_hashrate_display.get("1min", 0.0))
+
+                    # Enhancement: session averages are calculated from compiled API samples,
+                    # not delayed 1hr/24hr reported hash rates.
+                    session_avg_hr = average_reported_hashrates(api_hardware_session_hashrates) or current_hr
+                    session_avg_pool = average_reported_hashrates(api_pool_session_hashrates) or last_share_equiv_th
+
+                    # Enhancement: if the miner/wallet API exposes difficulty, use it for the static difficulty display.
+                    wallet_difficulty = get_wallet_difficulty(wallet_data)
+                    if wallet_difficulty is not None:
+                        current_difficulty = str(wallet_difficulty)
+                    else:
+                        current_difficulty = str(api_pool_display.get("difficulty", current_difficulty))
+                    difficulty_mode = "Static"
+
+                    # Enhancement: Pool Efficiency Current must equal miner/wallet API hashrate_live.
+                    # Set it directly from hashrate_live every API-driven render cycle, even if it is 0.
+                    last_share_equiv_th = get_wallet_hashrate_th(wallet_data, ("hashrate_live",))
+                    avg_pool_equiv = last_share_equiv_th
+
+                    total_candidates = int(api_shares_display.get("total", total_candidates) or 0)
+                    total_shares = int(api_shares_display.get("accepted", total_shares) or 0)
+                    api_rejected_shares = int(api_shares_display.get("rejected", 0) or 0)
+
                 hardware_speed_line = (
                     f"  ⚡ Hardware Speed : Current: [cyan]{current_hr:.2f} TH/s[/cyan] | "
                     f"Session Avg: {session_avg_hr:.2f} TH/s"
@@ -1042,13 +1289,18 @@ class AlphaMinerTUI(App):
                     hardware_speed_line += f" | Total Logging Avg: {total_logging_avg_hr:.2f} TH/s"
                     pool_efficiency_line += f" | Total Logging Avg: {total_logging_avg_pool:.2f} TH/s"
 
-                elapsed_mins = (datetime.now() - start_time).total_seconds() / 60.0
                 # work_hit_pct intentionally hidden from the card for now; kept here in case you want it back.
                 # work_hit_pct = (last_hits / last_attempts * 100.0) if last_attempts > 0 else 0.0
                 candidate_basis = total_candidates if total_candidates > 0 else last_hits
-                calculated_stales = max(0, candidate_basis - total_shares)
-                stale_pct = (calculated_stales / candidate_basis * 100.0) if candidate_basis > 0 else 0.0
-                submit_pct = (total_shares / candidate_basis * 100.0) if candidate_basis > 0 else 0.0
+                if use_realtime_miner_api and api_rejected_shares is not None:
+                    # Enhancement: realtime API stale/submitted math uses shares.rejected, shares.total, and shares.accepted.
+                    calculated_stales = api_rejected_shares
+                    stale_pct = (calculated_stales / candidate_basis * 100.0) if candidate_basis > 0 else 0.0
+                    submit_pct = (total_shares / candidate_basis * 100.0) if candidate_basis > 0 else 0.0
+                else:
+                    calculated_stales = max(0, candidate_basis - total_shares)
+                    stale_pct = (calculated_stales / candidate_basis * 100.0) if candidate_basis > 0 else 0.0
+                    submit_pct = (total_shares / candidate_basis * 100.0) if candidate_basis > 0 else 0.0
 
                 try:
                     current_difficulty_display = f"{float(current_difficulty):,.0f}"
