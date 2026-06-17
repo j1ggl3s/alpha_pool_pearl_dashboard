@@ -1,6 +1,6 @@
 ## I had AI write this for me, forgive any mistakes
 
-# Docker Miner Live Dashboard Monitor
+# Docker & API - Pearl Miner Live Dashboard Monitor
 
 This is a dynamic, real-time command line dashboard and performance tracker for mining Pearl inside Docker containers. This Python script automatically aggregates information from your active container logs, localized historic files, your graphics card telemetry, online market pricing index APIs, and pool data to build a consolidated performance monitor.
 
@@ -56,15 +56,17 @@ First, ensure your mining Docker container is currently up and running.
 
 Second, open your terminal or command prompt in the exact folder containing your live_monitor.py file.
 
-Third, launch the dashboard by typing this command:
+Third, launch the dashboard by typing this command (or whatever name you gave the py file):
 
 `python live_monitor.py`
 
 During Phase One, the script will digest historical records to calibrate your averages. During Phase Two, the terminal window will lock into a continuous dashboard view, automatically painting live logs, accepted shares, global statistics, and profits every few seconds.
 
-To stop the script at any time, press the CTRL and C keys on your keyboard together to exit safely.
+To stop the script at any time, press the CTRL and C keys on your keyboard together to exit safely, or "q", or just click the Quit App.
 
 ## Troubleshooting Common Issues
+
+If using the API monitor, ensure `--api-enable` is set when calling your mining program such as SRB.
 
 If you see a Docker Error message, your container named in the script configuration is either spelled wrong or the Docker Desktop application is not running.
 
